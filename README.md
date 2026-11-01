@@ -36,3 +36,31 @@ GUI создаёт/обновляет их при старте (пишет то�
 Скриншоты при разработке (не входит в обычную сборку):
     cargo build --release --features devshot
     PASS2FA_DEV_PASS=… PASS2FA_DEV_TAB=codes|logins|settings|edit|picker|lock PASS2FA_DEV_SHOT=/tmp/x.png pass2fa
+
+## Группы паролей
+Слева — группы как фильтр («Все группы», свои, «Без группы»). Запись переносится перетаскиванием
+за иконку/имя на группу или ПКМ → «Переместить в группу»; ПКМ по группе — переименовать/удалить
+(записи не удаляются, уходят в «Без группы»). Импорт берёт группы из Bitwarden `folder`,
+Proton Pass `vault`, KeePass `Group`, PassVault `category`; экспорт в PassVault пишет группу в `category`.
+
+## Генератор
+Над списком паролей: «Сгенерировать в буфер» (или Ctrl+G) — новый пароль сразу в буфере, без создания записи.
+
+## Браузер (native messaging, без демона)
+Браузер сам запускает `pass2fa` на каждый запрос и закрывает его. Разблокировка общая для окна,
+расширения и CLI: kernel keyring пользователя, 30 мин без обращений (на диск не пишется), быстрый кэш —
+в `$XDG_RUNTIME_DIR/pass2fa` (tmpfs). «Блок»/Ctrl+L в окне и `pass2fa lock` закрывают всё.
+Заполнение только по действию (клик / Alt+Shift+L — логин, Alt+Shift+O — TOTP, Alt+Shift+P — окно),
+только https (http — лишь для localhost), только верхний фрейм, хост сравнивается строго.
+
+    install -Dm755 target/release/pass2fa ~/.local/bin/pass2fa
+    ~/.local/bin/pass2fa install-browser      # манифест хоста указывает на этот бинарник
+    ./tools/build-extension.sh                # extension/dist/{firefox,chromium}, pass2fa-firefox.xpi
+
+- Chromium/Brave/Vivaldi: `chrome://extensions` → режим разработчика → «Загрузить распакованное» → `extension/dist/chromium`
+  (id фиксирован ключом в манифесте: `mppimlmnkoibdoennahbdmclgegncjed`).
+- LibreWolf / Firefox ESR / Developer Edition: `about:config` → `xpinstall.signatures.required = false`,
+  затем `about:addons` → «Установить из файла» → `extension/dist/pass2fa-firefox.xpi`.
+- Обычный Firefox неподписанное расширение насовсем не ставит: либо `about:debugging` (до перезапуска),
+  либо подпись «unlisted» через AMO (нужен аккаунт Mozilla).
+- Windows: хост пока не реализован (нужен ключ реестра HKCU и DPAPI вместо keyring).

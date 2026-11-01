@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "pass2fa",
+  "version": "0.3.0",
+  "description": "Заполнение логинов и TOTP из локального pass2fa (native messaging, без сети и аккаунтов)",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr/vSkLlNoy1whohV1BYNKfWK9IYAyFwqRYOWH5K45xEpmlu85DsVkof3htkSJcwQSxMai+VsYB85FAXvNoydTsdave2UNMXfaw2sN7g0FSxfxB4Sc7OL0LA1SEPXs46uL5aKJKJRWwpSUSVWwtPRYMfv882UtVrPLCCnnMKNLiVzFLLzmzUXk5gm4rjvvJ5p/ZZLVtnSHneIeF8z4mgEURfQEo+LCaffwkU+fO4zEHCztN2cxXm8W1VHuCNNhZmfpQTWKsOdio9eQ/3A8uyUoh285YuSq1OE/VxhEX9GyIipmFXcCpgTzgedYdcGyiTZS68WauyI6R0lImt7TugsLQIDAQAB",
+  "permissions": ["nativeMessaging", "activeTab", "scripting", "clipboardWrite"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "pass2fa",
+    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png" }
+  },
+  "icons": { "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "commands": {
+    "_execute_action": { "suggested_key": { "default": "Alt+Shift+P" }, "description": "Открыть pass2fa" },
+    "fill-login": { "suggested_key": { "default": "Alt+Shift+L" }, "description": "Заполнить логин для этого сайта" },
+    "fill-totp": { "suggested_key": { "default": "Alt+Shift+O" }, "description": "Вставить TOTP-код для этого сайта" }
+  }
+}

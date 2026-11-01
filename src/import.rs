@@ -114,6 +114,8 @@ fn foreign_json(val: &serde_json::Value) -> Result<Vault, String> {
                 password: pw.to_string(),
                 note: g("notes"),
                 icon: None,
+                // PassVault ставит «General» по умолчанию — это не группа
+                group: Some(g("category")).filter(|c| !c.is_empty() && c != "General").unwrap_or_default(),
             });
         }
     }
@@ -152,6 +154,8 @@ fn from_csv(text: &str) -> Result<Vault, String> {
     let c_note = col(&["note", "notes", "extra"]);
     let c_totp = col(&["totp", "login_totp", "otp", "otpauth"]);
     let c_type = col(&["type"]);
+    // папка/группа: Bitwarden folder, Proton Pass vault, KeePass Group, LastPass grouping
+    let c_group = col(&["group", "folder", "vault", "grouping", "category"]);
     if c_pass.is_none() && c_totp.is_none() {
         return Err(format!("CSV: не нашёл колонок password/totp, заголовок: {:?}", hdr));
     }
@@ -177,7 +181,7 @@ fn from_csv(text: &str) -> Result<Vault, String> {
         let note = get(c_note);
         let otp = get(c_totp);
         if !password.is_empty() || !username.is_empty() {
-            v.passwords.push(LoginEntry { name: name.clone(), url, username: username.clone(), password, note, icon: None });
+            v.passwords.push(LoginEntry { name: name.clone(), url, username: username.clone(), password, note, icon: None, group: get(c_group) });
         }
         if !otp.is_empty() {
             let e = if otp.starts_with("otpauth://") {
@@ -232,8 +236,8 @@ mod tests {
     #[test]
     fn passvault_roundtrip() {
         let mut v = Vault::default();
-        v.passwords.push(LoginEntry { name: "GitHub".into(), url: "https://github.com".into(), username: "b0ris8".into(), password: "p@ss".into(), note: "n".into(), icon: None });
-        v.passwords.push(LoginEntry { name: "Заметка".into(), url: String::new(), username: String::new(), password: String::new(), note: "текст".into(), icon: None });
+        v.passwords.push(LoginEntry { name: "GitHub".into(), url: "https://github.com".into(), username: "b0ris8".into(), password: "p@ss".into(), note: "n".into(), icon: None, group: "Работа".into() });
+        v.passwords.push(LoginEntry { name: "Заметка".into(), url: String::new(), username: String::new(), password: String::new(), note: "текст".into(), icon: None, group: String::new() });
         let j = crate::export::passvault_json(&v);
         // ровно поля ImportRecord, nullable — явно
         let keys: Vec<_> = j[0].as_object().unwrap().keys().cloned().collect();
@@ -244,6 +248,8 @@ mod tests {
         assert_eq!(back.passwords.len(), 2);
         assert_eq!(back.passwords[0].password, "p@ss");
         assert_eq!(back.passwords[0].username, "b0ris8");
+        assert_eq!(back.passwords[0].group, "Работа");
+        assert_eq!(back.passwords[1].group, "");
     }
     #[test]
     fn passvault_customfield_totp() {
@@ -251,6 +257,7 @@ mod tests {
             "customFields":[{"id":"1","name":"2fa","value":"otpauth://totp/Site:me?secret=JBSWY3DPEHPK3PXP","isSecret":true,"meta":{},"order":0}],"type":"PASSWORD"}]"#).unwrap();
         let v = foreign_json(&j).unwrap();
         assert_eq!(v.passwords[0].username, "me@x.md");
+        assert_eq!(v.passwords[0].group, "");
         assert_eq!(v.codes.len(), 1);
     }
     #[test]
@@ -267,6 +274,7 @@ mod tests {
         let v = from_csv(s).unwrap();
         assert_eq!(v.passwords.len(), 1);
         assert_eq!(v.passwords[0].username, "me@x.md");
+        assert_eq!(v.passwords[0].group, "Personal");
         assert_eq!(v.codes.len(), 1);
     }
 }

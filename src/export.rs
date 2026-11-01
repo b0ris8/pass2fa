@@ -76,7 +76,7 @@ pub fn passvault_json(v: &Vault) -> serde_json::Value {
                     "password": l.password,
                     "email": null,
                     "url": opt(&l.url),
-                    "category": "General",
+                    "category": if l.group.is_empty() { "General" } else { l.group.as_str() },
                     "notes": opt(&l.note),
                     "createdAt": now,
                     "updatedAt": now,

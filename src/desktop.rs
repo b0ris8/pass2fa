@@ -77,7 +77,36 @@ pub fn ensure_installed() -> Result<Vec<PathBuf>, String> {
         .map_err(|e| e.to_string())?;
         put(&png, &buf)?;
     }
+    if !written.is_empty() {
+        refresh_icon_cache();
+    }
     Ok(written)
+}
+
+/// Если в ~/.local/share/icons/hicolor лежит icon-theme.cache, Qt/GTK верят ему, пока не изменилась
+/// дата папки темы, — и новую иконку не видят (панель показывает заглушку). Пересобираем кэш
+/// gtk-update-icon-cache, если он есть; иначе просто обновляем дату папки — кэш считается устаревшим.
+#[cfg(unix)]
+fn refresh_icon_cache() {
+    let Some(theme) = dirs::data_dir().map(|d| d.join("icons/hicolor")) else { return };
+    if !theme.join("icon-theme.cache").exists() {
+        return;
+    }
+    let rebuilt = ["gtk-update-icon-cache", "gtk4-update-icon-cache"].iter().any(|bin| {
+        std::process::Command::new(bin)
+            .args(["-f", "-q"])
+            .arg(&theme)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if !rebuilt {
+        if let Ok(f) = std::fs::File::open(&theme) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
 }
 
 #[cfg(unix)]

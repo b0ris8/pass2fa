@@ -2,7 +2,7 @@
 use crate::filepick::{Outcome, Picker, Purpose};
 use crate::gen::{self, GenOpts};
 use crate::model::{Algo, LoginEntry, TotpEntry, Vault};
-use crate::{export, icons, import, totp, vault};
+use crate::{export, icons, import, session, totp, vault};
 use age::secrecy::{ExposeSecret, SecretString};
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -114,6 +114,9 @@ impl Saver {
                     skipped += 1;
                 }
                 let r = vault::save(&path, &job.1, &job.0);
+                if r.is_ok() {
+                    session::refresh_cache(&path, &job.0); // браузер видит изменения сразу
+                }
                 for _ in 0..skipped {
                     let _ = wtx.send(Ok(()));
                 }
@@ -255,6 +258,16 @@ struct Session {
     np1: String,
     np2: String,
     show_np: bool,
+    /// None — «Все группы»; Some("") — «Без группы»; Some(имя) — группа
+    group_filter: Option<String>,
+    /// поле «новая группа» в боковой панели
+    new_group: Option<String>,
+    /// переименование: (старое имя, новое)
+    rename_group: Option<(String, String)>,
+    /// удаление группы: ждём подтверждения
+    confirm_group_del: Option<String>,
+    gen_last: String,
+    gen_show: bool,
 }
 
 struct App {
@@ -267,6 +280,109 @@ struct App {
     ic: IconCache,
     #[cfg(feature = "devshot")]
     frames: u32,
+}
+
+/// Перетаскиваемая запись пароля (индекс в vault.passwords).
+struct DragLogin(usize);
+
+enum GroupAct {
+    Add(String),
+    Rename(String, String),
+    Remove(String),
+}
+
+/// Боковая панель групп: фильтр + цель для перетаскивания записей.
+fn groups_panel(ui: &mut egui::Ui, s: &mut Session, act: &mut Option<GroupAct>, move_to: &mut Option<(usize, String)>) {
+    let total = s.v.passwords.len();
+    let none_cnt = s.v.passwords.iter().filter(|l| l.group.is_empty()).count();
+    let groups = s.v.all_groups();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Группы").strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button(PLUS).on_hover_text("новая группа").clicked() && s.new_group.is_none() {
+                s.new_group = Some(String::new());
+            }
+        });
+    });
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // элемент списка: выбор фильтра + приём перетаскивания
+        let mut item = |ui: &mut egui::Ui, filter: Option<String>, label: String, count: usize, target: Option<String>| -> egui::Response {
+            let selected = s.group_filter == filter;
+            let hovered_drop = target.is_some() && egui::DragAndDrop::has_payload_of_type::<DragLogin>(ui.ctx());
+            let atoms = (
+                RichText::new(label).color(N6),
+                egui::Atom::grow(),
+                RichText::new(count.to_string()).small().color(SUB),
+            );
+            let r = ui.add(
+                egui::Button::selectable(selected, atoms)
+                    .frame_when_inactive(selected)
+                    .min_size(Vec2::new(ui.available_width(), 26.0)),
+            );
+            if let (Some(t), true) = (&target, hovered_drop) {
+                if r.dnd_hover_payload::<DragLogin>().is_some() {
+                    ui.painter().rect_stroke(r.rect, 5.0, egui::Stroke::new(2.0, GRN), egui::StrokeKind::Inside);
+                }
+                if let Some(p) = r.dnd_release_payload::<DragLogin>() {
+                    *move_to = Some((p.0, t.clone()));
+                }
+            }
+            if r.clicked() { s.group_filter = filter; }
+            r
+        };
+        item(ui, None, format!("{FOLDER_OPEN} Все группы"), total, None);
+        ui.separator();
+        for g in &groups {
+            let cnt = s.v.passwords.iter().filter(|l| &l.group == g).count();
+            let r = item(ui, Some(g.clone()), format!("{FOLDER} {g}"), cnt, Some(g.clone()));
+            r.context_menu(|ui| {
+                if ui.button(format!("{EDIT} Переименовать")).clicked() {
+                    s.rename_group = Some((g.clone(), g.clone()));
+                    ui.close();
+                }
+                if ui.button(format!("{TRASH} Удалить группу")).on_hover_text("записи не удаляются — уходят в «Без группы»").clicked() {
+                    s.confirm_group_del = Some(g.clone());
+                    ui.close();
+                }
+            });
+        }
+        item(ui, Some(String::new()), format!("{FOLDER} Без группы"), none_cnt, Some(String::new()));
+        ui.add_space(8.0);
+        if let Some(ng) = &mut s.new_group {
+            let r = ui.add(egui::TextEdit::singleline(ng).hint_text("имя группы + Enter").desired_width(f32::INFINITY));
+            r.request_focus();
+            if enter(&r) {
+                if !ng.trim().is_empty() { *act = Some(GroupAct::Add(ng.trim().to_string())); }
+                s.new_group = None;
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                s.new_group = None;
+            }
+        }
+        if let Some((old, new)) = &mut s.rename_group {
+            ui.label(RichText::new(format!("Переименовать «{old}»")).small().color(SUB));
+            let r = ui.add(egui::TextEdit::singleline(new).desired_width(f32::INFINITY));
+            r.request_focus();
+            if enter(&r) {
+                if !new.trim().is_empty() && new.trim() != old { *act = Some(GroupAct::Rename(old.clone(), new.trim().to_string())); }
+                s.rename_group = None;
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                s.rename_group = None;
+            }
+        }
+        if let Some(g) = s.confirm_group_del.clone() {
+            ui.colored_label(YEL, format!("Удалить группу «{g}»? Записи останутся."));
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new(format!("{CHECK} удалить")).color(RED)).clicked() {
+                    *act = Some(GroupAct::Remove(g.clone()));
+                    s.confirm_group_del = None;
+                }
+                if ui.button(X).clicked() { s.confirm_group_del = None; }
+            });
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new(format!("Перетащи запись за иконку/имя на группу или ПКМ {ARROW_RIGHT} «Переместить в группу».")).small().color(SUB));
+    });
 }
 
 /// Число с кнопками «−» / «+» (значение можно и тянуть мышью, и ввести).
@@ -358,7 +474,18 @@ impl App {
             cc.egui_ctx.set_zoom_factor(z);
         }
         let screen = if vault::exists(&path) {
-            Screen::Locked { pass: String::new(), err: None, show: false }
+            // сессия уже открыта (браузер/другое окно) — не спрашиваем пароль повторно
+            match session::passphrase() {
+                Some(p) => {
+                    let (tx, rx) = mpsc::channel();
+                    let path2 = path.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(vault::load(&path2, &p).map(|v| (v, p)));
+                    });
+                    Screen::Unlocking(rx)
+                }
+                None => Screen::Locked { pass: String::new(), err: None, show: false },
+            }
         } else {
             Screen::Create { p1: String::new(), p2: String::new(), err: None, show: false }
         };
@@ -385,11 +512,16 @@ impl App {
         self.msg(format!("{what} скопирован, буфер очистится через {} с", CLIP_CLEAR.as_secs()), GRN);
     }
 
-    fn lock(&mut self) {
+    /// full = true: закрыть и общую сессию (браузер, CLI); false — только окно (автоблокировка по простою).
+    fn lock(&mut self, full: bool) {
+        if full {
+            session::clear();
+        }
         if let Screen::Open(s) = &mut self.screen {
             s.np0.zeroize();
             s.np1.zeroize();
             s.np2.zeroize();
+            s.gen_last.zeroize();
             if let Some(Edit::Login { e, .. }) = &mut s.edit { e.zeroize(); }
         }
         // Session -> drop: Vault и записи затираются (ZeroizeOnDrop)
@@ -405,9 +537,13 @@ impl eframe::App for App {
         let active = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving());
         if active { self.last_input = Instant::now(); }
         if matches!(self.screen, Screen::Open(_)) {
-            if self.last_input.elapsed() > AUTOLOCK || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::L)) {
-                self.lock();
-                self.msg("Заблокировано", N8);
+            let hotkey = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::L));
+            if hotkey {
+                self.lock(true);
+                self.msg("Заблокировано (окно и браузер)", N8);
+            } else if self.last_input.elapsed() > AUTOLOCK {
+                self.lock(false);
+                self.msg(format!("Окно заблокировано по простою; браузер — по своему таймауту {} мин", session::TTL_SECS / 60), N8);
             }
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -533,6 +669,12 @@ impl Session {
             np1: String::new(),
             np2: String::new(),
             show_np: false,
+            group_filter: None,
+            new_group: None,
+            rename_group: None,
+            confirm_group_del: None,
+            gen_last: String::new(),
+            gen_show: false,
         }
     }
     fn matches(&self, hay: &[&str]) -> bool {
@@ -568,7 +710,10 @@ impl App {
                 let path = self.path.clone();
                 let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let r = vault::load(&path, &p).map(|v| (v, p));
+                    let r = vault::load(&path, &p).map(|v| {
+                        let _ = session::publish(&path, &p, &v); // общая разблокировка для браузера/CLI
+                        (v, p)
+                    });
                     let _ = tx.send(r);
                 });
                 self.screen = Screen::Unlocking(rx);
@@ -664,7 +809,7 @@ impl App {
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) && s.edit.is_none() && s.picker.is_none() { s.filter.clear(); }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let lock = if compact { LOCK.to_string() } else { format!("{LOCK} Блок") };
-                    if ui.button(lock).on_hover_text("Заблокировать (Ctrl+L)").clicked() { want_lock = true; }
+                    if ui.button(lock).on_hover_text("Заблокировать окно и браузер (Ctrl+L)").clicked() { want_lock = true; }
                     match s.tab {
                         Tab::Codes => {
                             let t = if compact { PLUS.to_string() } else { format!("{PLUS} 2FA") };
@@ -675,7 +820,9 @@ impl App {
                         Tab::Logins => {
                             let t = if compact { PLUS.to_string() } else { format!("{PLUS} Пароль") };
                             if ui.button(t).on_hover_text("Добавить пароль").clicked() {
-                                s.edit = Some(Edit::Login { idx: None, e: LoginEntry::default(), show: true });
+                                let mut e = LoginEntry::default();
+                                e.group = s.group_filter.clone().unwrap_or_default();
+                                s.edit = Some(Edit::Login { idx: None, e, show: true });
                             }
                         }
                         Tab::Settings => {}
@@ -684,6 +831,21 @@ impl App {
             });
             ui.add_space(4.0);
         });
+
+        // --- группы слева (только на вкладке паролей и если окно не узкое)
+        let mut group_act: Option<GroupAct> = None;
+        let mut move_to: Option<(usize, String)> = None;
+        let narrow_groups = ui.available_width() < 640.0;
+        if s.tab == Tab::Logins && !narrow_groups {
+            egui::Panel::left("groups")
+                .resizable(true)
+                .default_size(210.0)
+                .size_range(150.0..=360.0)
+                .frame(egui::Frame::new().fill(N1).inner_margin(egui::Margin::symmetric(8, 10)))
+                .show(ui, |ui| {
+                    groups_panel(ui, s, &mut group_act, &mut move_to);
+                });
+        }
 
         egui::CentralPanel::default_margins().frame(egui::Frame::new().fill(N0).inner_margin(10.0)).show(ui, |ui| {
             match s.tab {
@@ -748,10 +910,66 @@ impl App {
                     });
                 }
                 Tab::Logins => {
+                    // --- генератор: одна кнопка — новый пароль сразу в буфер
+                    column(ui, LOGINS_W, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new(format!("{DICE} Сгенерировать в буфер")).strong()).fill(N10))
+                                .on_hover_text("новый пароль сразу копируется (Ctrl+G)").clicked()
+                                || ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G))
+                            {
+                                s.gen_last.zeroize();
+                                s.gen_last = gen::generate(&s.gen);
+                                to_copy = Some((s.gen_last.clone(), "Новый пароль"));
+                            }
+                            let mut n = s.gen.len as i64;
+                            stepper(ui, &mut n, 8, 128, 1, " симв.");
+                            s.gen.len = n as usize;
+                            ui.checkbox(&mut s.gen.upper, "A-Z");
+                            ui.checkbox(&mut s.gen.digits, "0-9");
+                            ui.checkbox(&mut s.gen.symbols, "!#$");
+                            if !s.gen_last.is_empty() {
+                                ui.separator();
+                                let t = if s.gen_show { s.gen_last.clone() } else { "•".repeat(s.gen_last.chars().count().min(16)) };
+                                ui.add(egui::Label::new(RichText::new(t).monospace().color(N8)).truncate());
+                                if ui.small_button(if s.gen_show { EYE_OFF } else { EYE }).clicked() { s.gen_show = !s.gen_show; }
+                                if ui.small_button(COPY).on_hover_text("скопировать ещё раз").clicked() {
+                                    to_copy = Some((s.gen_last.clone(), "Пароль"));
+                                }
+                                if ui.small_button(PLUS).on_hover_text("создать запись с этим паролем").clicked() {
+                                    let mut e = LoginEntry::default();
+                                    e.password = s.gen_last.clone();
+                                    e.group = s.group_filter.clone().unwrap_or_default();
+                                    s.edit = Some(Edit::Login { idx: None, e, show: true });
+                                }
+                            }
+                        });
+                        if narrow_groups {
+                            // узкое окно: группы — выпадающим списком вместо боковой панели
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{FOLDER}"));
+                                let cur = match &s.group_filter { None => "Все группы".to_string(), Some(g) if g.is_empty() => "Без группы".into(), Some(g) => g.clone() };
+                                egui::ComboBox::from_id_salt("grp_combo").selected_text(cur).show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut s.group_filter, None, "Все группы");
+                                    for g in s.v.all_groups() {
+                                        ui.selectable_value(&mut s.group_filter, Some(g.clone()), g);
+                                    }
+                                    ui.selectable_value(&mut s.group_filter, Some(String::new()), "Без группы");
+                                });
+                            });
+                        }
+                        ui.add_space(4.0);
+                    });
                     let rows: Vec<usize> = (0..s.v.passwords.len())
-                        .filter(|&i| { let l = &s.v.passwords[i]; s.matches(&[&l.name, &l.url, &l.username, &l.note]) })
+                        .filter(|&i| {
+                            let l = &s.v.passwords[i];
+                            s.group_filter.as_ref().is_none_or(|g| &l.group == g)
+                                && s.matches(&[&l.name, &l.url, &l.username, &l.note, &l.group])
+                        })
                         .collect();
-                    if s.v.passwords.is_empty() { ui.label("Пусто."); }
+                    if rows.is_empty() {
+                        ui.label(if s.v.passwords.is_empty() { "Пусто." } else { "В этой группе ничего нет — перетащи сюда записи или выбери «Все группы»." });
+                    }
+                    let groups = s.v.all_groups();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
                         column(ui, LOGINS_W, |ui| {
                             for k in range {
@@ -761,6 +979,7 @@ impl App {
                                     ui.set_height(ROW_H - 4.0);
                                     ui.horizontal_centered(|ui| {
                                         let l = &s.v.passwords[i];
+                                        let icon_rect = ui.cursor();
                                         ic.paint(ui, l.icon.as_deref(), &login_cands(l), &l.name, ICON);
                                         ui.add_space(6.0);
                                         // справа: логин+кн, пароль+2кн, 2 кн; колонки логина/пароля сжимаются в узком окне,
@@ -771,21 +990,56 @@ impl App {
                                         let name_w = (aw - right).max(80.0);
                                         let sub = icons::host(&l.url).unwrap_or_else(|| l.url.clone());
                                         let sub = (!sub.is_empty() && sub != l.name.trim_start_matches("www.")).then_some(sub);
+                                        // в «Все группы» подписываем группу записи
+                                        let sub = match (&s.group_filter, l.group.is_empty(), sub) {
+                                            (None, false, Some(h)) => Some(format!("{h} · {FOLDER} {}", l.group)),
+                                            (None, false, None) => Some(format!("{FOLDER} {}", l.group)),
+                                            (_, _, x) => x,
+                                        };
                                         let lay = if sub.is_some() {
                                             Layout::top_down(Align::Min).with_main_align(Align::Center)
                                         } else {
                                             Layout::left_to_right(Align::Center)
                                         };
-                                        ui.allocate_ui_with_layout(Vec2::new(name_w, ROW_H - 8.0), lay, |ui| {
+                                        let name_resp = ui.allocate_ui_with_layout(Vec2::new(name_w, ROW_H - 8.0), lay, |ui| {
                                             ui.set_min_width(name_w);
                                             ui.set_max_width(name_w);
                                             ui.spacing_mut().item_spacing.y = 0.0;
-                                            let r = ui.add(egui::Label::new(RichText::new(&l.name).strong().size(15.0)).truncate());
+                                            ui.add(egui::Label::new(RichText::new(&l.name).strong().size(15.0)).truncate());
                                             if let Some(sub) = sub {
                                                 ui.add(egui::Label::new(RichText::new(sub).small().color(SUB)).truncate());
                                             }
-                                            if !l.note.is_empty() { r.on_hover_text(&l.note); }
+                                        }).response;
+                                        // за иконку и имя запись можно тащить на группу; ПКМ — меню; двойной клик — изменить
+                                        let grab = icon_rect.min.x;
+                                        let handle = egui::Rect::from_min_max(egui::pos2(grab, name_resp.rect.min.y), name_resp.rect.max);
+                                        let h = ui.interact(handle, egui::Id::unique(("pass2fa-row", i)), egui::Sense::click_and_drag());
+                                        let h = if l.note.is_empty() { h } else { h.on_hover_text(&l.note) };
+                                        h.dnd_set_drag_payload(DragLogin(i));
+                                        if h.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::Grab); }
+                                        if h.double_clicked() {
+                                            s.edit = Some(Edit::Login { idx: Some(i), e: s.v.passwords[i].clone(), show: false });
+                                        }
+                                        let cur_group = l.group.clone();
+                                        h.context_menu(|ui| {
+                                            ui.label(RichText::new("Переместить в группу").small().color(SUB));
+                                            for g in &groups {
+                                                if ui.add_enabled(g != &cur_group, egui::Button::new(format!("{FOLDER} {g}"))).clicked() {
+                                                    move_to = Some((i, g.clone()));
+                                                    ui.close();
+                                                }
+                                            }
+                                            if ui.add_enabled(!cur_group.is_empty(), egui::Button::new("Без группы")).clicked() {
+                                                move_to = Some((i, String::new()));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui.button(format!("{PLUS} Новая группа…")).clicked() {
+                                                s.new_group = Some(String::new());
+                                                ui.close();
+                                            }
                                         });
+                                        let l = &s.v.passwords[i];
                                         if user_w > 0.0 {
                                             ui.allocate_ui_with_layout(Vec2::new(user_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
                                                 ui.set_min_width(user_w);
@@ -821,6 +1075,20 @@ impl App {
                             }
                         });
                     });
+                    // что тащим — подпись у курсора
+                    if let (Some(p), Some(pos)) = (egui::DragAndDrop::payload::<DragLogin>(ui.ctx()), ui.ctx().pointer_latest_pos()) {
+                        if let Some(l) = s.v.passwords.get(p.0) {
+                            egui::Area::new(egui::Id::unique("pass2fa-drag-preview"))
+                                .order(egui::Order::Tooltip)
+                                .fixed_pos(pos + Vec2::new(14.0, 10.0))
+                                .interactable(false)
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.label(format!("{KEY} {}  {ARROW_RIGHT}  {FOLDER} группа", l.name));
+                                    });
+                                });
+                        }
+                    }
                 }
                 Tab::Settings => {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| column(ui, 860.0, |ui| {
@@ -851,7 +1119,7 @@ impl App {
                         ui.add_space(16.0);
                         ui.separator();
                         ui.heading(format!("{EXPORT} Экспорт паролей для PassVault"));
-                        ui.label("Открытый JSON (формат PassVault). В PassVault: Импорт → PassVault JSON, пароль файла пустой. После переноса удалить файл и на ПК, и на устройстве.");
+                        ui.label(format!("Открытый JSON (формат PassVault). В PassVault: Импорт {ARROW_RIGHT} PassVault JSON, пароль файла пустой. После переноса удалить файл и на ПК, и на устройстве."));
                         ui.horizontal(|ui| {
                             if ui.button(format!("{FOLDER_OPEN} Куда сохранить…")).clicked() {
                                 s.picker = Some(Picker::open(Purpose::ExportPassVault, &["json"], Some("passvault-export.json")));
@@ -899,10 +1167,46 @@ impl App {
                         ui.label("Восстановление без программы: age -d vault.age > vault.json");
                         ui.label(format!("Автоблокировка: {} мин без действий; буфер обмена чистится через {} с.", AUTOLOCK.as_secs() / 60, CLIP_CLEAR.as_secs()));
                         ui.label("Иконки: Simple Icons (CC0), офлайн, подбираются по имени/issuer/домену. Своя — в карточке записи.");
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.heading(format!("{GLOBE} Браузер"));
+                        ui.label(format!(
+                            "Разблокировка общая: окно, браузерное расширение и CLI. Держится {} мин без обращений (kernel keyring, на диск не пишется). «Блок»/Ctrl+L закрывают всё; автоблокировка по простою — только окно.",
+                            session::TTL_SECS / 60
+                        ));
+                        ui.label(format!("Установка хоста: pass2fa install-browser · id расширения: Firefox/LibreWolf {}, Chromium {}", crate::native::FIREFOX_EXT_ID, crate::native::CHROMIUM_EXT_ID));
                     }));
                 }
             }
         });
+
+        // группы: перенос записи и действия над группами
+        if let Some((i, g)) = move_to {
+            let name = s.v.passwords.get_mut(i).filter(|l| l.group != g).map(|l| {
+                l.group = g.clone();
+                l.name.clone()
+            });
+            if let Some(name) = name {
+                s.v.add_group(&g);
+                dirty = true;
+                message = Some((format!("{name} {ARROW_RIGHT} {}", if g.is_empty() { "Без группы".into() } else { g }), GRN));
+            }
+        }
+        match group_act {
+            Some(GroupAct::Add(g)) => { s.v.add_group(&g); dirty = true; }
+            Some(GroupAct::Rename(o, n)) => {
+                s.v.rename_group(&o, &n);
+                if s.group_filter.as_deref() == Some(o.as_str()) { s.group_filter = Some(n.trim().to_string()); }
+                dirty = true;
+            }
+            Some(GroupAct::Remove(g)) => {
+                s.v.remove_group(&g);
+                if s.group_filter.as_deref() == Some(g.as_str()) { s.group_filter = None; }
+                dirty = true;
+                message = Some((format!("Группа «{g}» удалена, записи — в «Без группы»"), YEL));
+            }
+            None => {}
+        }
 
         // удаление
         if let Some((tab, i)) = del_now {
@@ -993,6 +1297,18 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            ui.label("Группа");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut e.group).hint_text("без группы").desired_width(250.0));
+                                egui::ComboBox::from_id_salt("edit_grp").selected_text(FOLDER).width(40.0).show_ui(ui, |ui| {
+                                    if ui.selectable_label(e.group.is_empty(), "Без группы").clicked() { e.group.clear(); }
+                                    for g in s.v.all_groups() {
+                                        let sel = e.group == g;
+                                        if ui.selectable_label(sel, &g).clicked() { e.group = g; }
+                                    }
+                                });
+                            });
+                            ui.end_row();
                             ui.label("Заметка"); ui.add(egui::TextEdit::multiline(&mut e.note).desired_rows(2).desired_width(380.0)); ui.end_row();
                             ui.label("Иконка");
                             pick_icon |= icon_row(ui, ic, &mut e.icon, &[e.url.as_str(), e.name.as_str()], &e.name);
@@ -1015,10 +1331,13 @@ impl App {
                         Some(i) if i < s.v.codes.len() => s.v.codes[i] = e.clone(),
                         _ => s.v.codes.push(e.clone()),
                     },
-                    Some(Edit::Login { idx, e, .. }) => match idx {
-                        Some(i) if i < s.v.passwords.len() => s.v.passwords[i] = e.clone(),
-                        _ => s.v.passwords.push(e.clone()),
-                    },
+                    Some(Edit::Login { idx, e, .. }) => {
+                        s.v.add_group(&e.group);
+                        match idx {
+                            Some(i) if i < s.v.passwords.len() => s.v.passwords[i] = e.clone(),
+                            _ => s.v.passwords.push(e.clone()),
+                        }
+                    }
                     None => {}
                 }
                 s.v.sort();
@@ -1063,7 +1382,7 @@ impl App {
         if let Some((m, c)) = message { self.msg(m, c); }
         if let Some((t, w)) = to_copy { self.copy(ctx, &t, w); }
         if let Some(p) = import_req { self.do_import(&p); }
-        if want_lock { self.lock(); }
+        if want_lock { self.lock(true); }
     }
 }
 
@@ -1088,14 +1407,14 @@ fn icon_row(ui: &mut egui::Ui, ic: &mut IconCache, field: &mut Option<String>, c
 
 fn export_msg(v: &Vault, p: &Path) -> (String, Color32) {
     match export::aegis_to_file(v, p) {
-        Ok(n) => (format!("{n} записей 2FA → {} (открытый текст — удали после переноса)", p.display()), YEL),
+        Ok(n) => (format!("{n} записей 2FA {ARROW_RIGHT} {} (открытый текст — удали после переноса)", p.display()), YEL),
         Err(e) => (format!("Экспорт: {e}"), RED),
     }
 }
 
 fn export_pv_msg(v: &Vault, p: &Path) -> (String, Color32) {
     match export::passvault_to_file(v, p) {
-        Ok(n) => (format!("{n} паролей → {} (открытый текст — удали после переноса)", p.display()), YEL),
+        Ok(n) => (format!("{n} паролей {ARROW_RIGHT} {} (открытый текст — удали после переноса)", p.display()), YEL),
         Err(e) => (format!("Экспорт: {e}"), RED),
     }
 }

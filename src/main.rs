@@ -6,6 +6,8 @@ mod icons;
 mod gui;
 mod import;
 mod model;
+mod native;
+mod session;
 mod totp;
 mod vault;
 
@@ -19,6 +21,9 @@ const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-ш�
   pass2fa code <подстрока имени>   напечатать текущий TOTP-код (для скриптов: | wl-copy)
   pass2fa export-aegis <файл>      2FA в открытый JSON для импорта в Aegis (после переноса удалить!)
   pass2fa export-passvault <файл>  пароли в открытый JSON для PassVault (после переноса удалить!)
+  pass2fa install-browser          манифест native messaging для Firefox/LibreWolf/Chromium (браузерное расширение)
+  pass2fa uninstall-browser        убрать его
+  pass2fa lock                     заблокировать общую сессию (GUI/браузер), стереть ключи из keyring
   pass2fa install-desktop          .desktop + иконка в ~/.local/share (GUI делает это сам при старте)
   pass2fa uninstall-desktop        убрать их
 
@@ -27,6 +32,11 @@ const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-ш�
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // запуск браузером как native messaging host: только stdin/stdout, без GUI
+    if native::invoked_by_browser(&args) || args.first().map(String::as_str) == Some("native-host") {
+        native::run(&vault::default_path());
+        return;
+    }
     let mut path = vault::default_path();
     if let Some(i) = args.iter().position(|a| a == "--vault") {
         if i + 1 >= args.len() { die("--vault: нужен путь"); }
@@ -39,6 +49,19 @@ fn main() {
         Some("code") if args.len() == 2 => cli_code(&path, &args[1]),
         Some("export-aegis") if args.len() == 2 => cli_export_aegis(&path, &args[1]),
         Some("export-passvault") if args.len() == 2 => cli_export_passvault(&path, &args[1]),
+        Some("install-browser") => native::install().map(|w| {
+            for p in w { eprintln!("записано: {}", p.display()); }
+            eprintln!("Firefox/LibreWolf: id расширения {}; Chromium: {}", native::FIREFOX_EXT_ID, native::CHROMIUM_EXT_ID);
+        }),
+        Some("uninstall-browser") => {
+            for p in native::uninstall() { eprintln!("удалено: {}", p.display()); }
+            Ok(())
+        }
+        Some("lock") => {
+            session::clear();
+            eprintln!("сессия заблокирована");
+            Ok(())
+        }
         Some("install-desktop") => desktop::ensure_installed().map(|w| {
             if w.is_empty() { eprintln!("уже установлено"); }
             for p in w { eprintln!("записано: {}", p.display()); }

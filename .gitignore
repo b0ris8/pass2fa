@@ -5,3 +5,9 @@
 *.age
 *.age.bak
 *.age.tmp
+
+# сборка расширения
+/extension/dist/
+# …но манифесты расширения — исходники
+!/extension/manifest.firefox.json
+!/extension/manifest.chromium.json

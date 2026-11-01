@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>pass2fa</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon-32.png" alt="" width="20" height="20">
+    <span id="host" class="host">…</span>
+    <button id="lock" class="icon" title="Заблокировать (окно, браузер, CLI)" hidden>⏻</button>
+  </header>
+
+  <section id="unlock" hidden>
+    <p class="muted">Хранилище заблокировано</p>
+    <form id="unlock-form">
+      <div class="row">
+        <input id="pass" type="password" placeholder="мастер-пароль" autocomplete="current-password" autofocus>
+        <button type="button" id="eye" class="icon" title="показать">👁</button>
+        <button type="submit" class="primary" title="Открыть">→</button>
+      </div>
+      <p id="layout" class="warn" hidden>в пароле кириллица — раскладка RU</p>
+    </form>
+  </section>
+
+  <section id="list" hidden>
+    <h2 id="logins-h">Логины</h2>
+    <ul id="logins"></ul>
+    <h2 id="totp-h">2FA</h2>
+    <ul id="totp"></ul>
+    <p id="empty" class="muted" hidden>Для этого сайта записей нет.</p>
+  </section>
+
+  <p id="msg" class="msg"></p>
+  <script src="common.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
