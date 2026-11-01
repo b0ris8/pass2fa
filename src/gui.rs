@@ -3,7 +3,8 @@ use crate::filepick::{Outcome, Picker, Purpose};
 use crate::gen::{self, GenOpts};
 use crate::model::{Algo, LoginEntry, TotpEntry, Vault};
 use crate::{export, icons, import, session, totp, vault};
-use age::secrecy::{ExposeSecret, SecretString};
+use age::secrecy::SecretString;
+use age::x25519::Identity;
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -96,7 +97,7 @@ pub fn run(path: PathBuf) -> eframe::Result<()> {
 
 // ---------- фоновое сохранение (scrypt ~1 c, UI не замирает) ----------
 struct Saver {
-    tx: Option<Sender<(Vault, SecretString)>>,
+    tx: Option<Sender<(Vault, Identity)>>,
     rx: Receiver<Result<(), String>>,
     pending: usize,
     handle: Option<JoinHandle<()>>,
@@ -104,7 +105,7 @@ struct Saver {
 
 impl Saver {
     fn new(path: PathBuf) -> Self {
-        let (tx, wrx) = mpsc::channel::<(Vault, SecretString)>();
+        let (tx, wrx) = mpsc::channel::<(Vault, Identity)>();
         let (wtx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             while let Ok(mut job) = wrx.recv() {
@@ -113,10 +114,7 @@ impl Saver {
                     job = newer; // пишем только самую свежую версию
                     skipped += 1;
                 }
-                let r = vault::save(&path, &job.1, &job.0);
-                if r.is_ok() {
-                    session::refresh_cache(&path, &job.0); // браузер видит изменения сразу
-                }
+                let r = vault::save(&path, &job.1, &job.0); // по ключу — миллисекунды
                 for _ in 0..skipped {
                     let _ = wtx.send(Ok(()));
                 }
@@ -125,7 +123,7 @@ impl Saver {
         });
         Self { tx: Some(tx), rx, pending: 0, handle: Some(handle) }
     }
-    fn submit(&mut self, v: &Vault, p: &SecretString) {
+    fn submit(&mut self, v: &Vault, p: &Identity) {
         if let Some(tx) = &self.tx {
             self.pending += 1;
             let _ = tx.send((v.clone(), p.clone()));
@@ -229,7 +227,7 @@ fn login_cands(l: &LoginEntry) -> [&str; 2] {
 enum Screen {
     Locked { pass: String, err: Option<String>, show: bool },
     Create { p1: String, p2: String, err: Option<String>, show: bool },
-    Unlocking(Receiver<Result<(Vault, SecretString), String>>),
+    Unlocking(Receiver<Result<(Vault, Identity), String>>),
     Open(Box<Session>),
 }
 
@@ -243,7 +241,10 @@ enum Edit {
 
 struct Session {
     v: Vault,
-    pass: SecretString,
+    /// ключ хранилища (мастер-пароль в памяти не держим)
+    id: Identity,
+    /// смена пароля идёт в фоне (scrypt ~2–3 с)
+    pw_job: Option<Receiver<Result<PathBuf, String>>>,
     tab: Tab,
     filter: String,
     shown: HashSet<usize>,
@@ -387,6 +388,28 @@ fn groups_panel(ui: &mut egui::Ui, s: &mut Session, act: &mut Option<GroupAct>, 
     });
 }
 
+const FORM_LABEL_W: f32 = 120.0;
+
+/// Строка формы: в широком окне подпись слева фиксированной ширины, в узком — над полем.
+fn form_row(ui: &mut egui::Ui, narrow: bool, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    if narrow {
+        if !label.is_empty() {
+            ui.label(RichText::new(label).small().color(SUB));
+        }
+        add(ui);
+        ui.add_space(6.0);
+    } else {
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(FORM_LABEL_W, 26.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_width(FORM_LABEL_W);
+                ui.label(label);
+            });
+            add(ui);
+        });
+        ui.add_space(4.0);
+    }
+}
+
 /// Число с кнопками «−» / «+» (значение можно и тянуть мышью, и ввести).
 fn stepper(ui: &mut egui::Ui, v: &mut i64, min: i64, max: i64, step: i64, suffix: &str) {
     ui.horizontal(|ui| {
@@ -486,12 +509,12 @@ impl App {
         }
         let screen = if vault::exists(&path) {
             // сессия уже открыта (браузер/другое окно) — не спрашиваем пароль повторно
-            match session::passphrase() {
-                Some(p) => {
+            match session::identity() {
+                Some(id) => {
                     let (tx, rx) = mpsc::channel();
                     let path2 = path.clone();
                     std::thread::spawn(move || {
-                        let _ = tx.send(vault::load(&path2, &p).map(|v| (v, p)));
+                        let _ = tx.send(vault::load_with(&path2, &id).map(|v| (v, id)));
                     });
                     Screen::Unlocking(rx)
                 }
@@ -584,9 +607,9 @@ impl eframe::App for App {
 
         if let Screen::Unlocking(rx) = &mut self.screen {
             match rx.try_recv() {
-                Ok(Ok((mut v, pass))) => {
+                Ok(Ok((mut v, id))) => {
                     v.sort();
-                    self.screen = Screen::Open(Box::new(Session::new(v, pass)));
+                    self.screen = Screen::Open(Box::new(Session::new(v, id)));
                 }
                 Ok(Err(e)) => self.screen = Screen::Locked { pass: String::new(), err: Some(e), show: false },
                 Err(_) => ctx.request_repaint_after(Duration::from_millis(100)),
@@ -660,7 +683,7 @@ impl App {
                 let p = SecretString::from(std::mem::take(pass));
                 let path = self.path.clone();
                 let (tx, rx) = mpsc::channel();
-                std::thread::spawn(move || { let _ = tx.send(vault::load(&path, &p).map(|v| (v, p))); });
+                std::thread::spawn(move || { let _ = tx.send(vault::unlock(&path, &p)); });
                 self.screen = Screen::Unlocking(rx);
             }
         }
@@ -668,7 +691,7 @@ impl App {
             match std::env::var("PASS2FA_DEV_TAB").as_deref() {
                 Ok("logins") => s.tab = Tab::Logins,
                 Ok("settings") => s.tab = Tab::Settings,
-                Ok("edit") if s.edit.is_none() => s.edit = Some(Edit::Login { idx: Some(0), e: s.v.passwords[0].clone(), show: false }),
+                Ok("edit" | "editnarrow") if s.edit.is_none() => s.edit = Some(Edit::Login { idx: Some(0), e: s.v.passwords[0].clone(), show: false }),
                 Ok("picker") if s.picker.is_none() => s.picker = Some(Picker::open(Purpose::Import, &["csv", "json", "txt"], None)),
                 Ok("gen") if self.frames == 8 => {
                     s.tab = Tab::Logins;
@@ -697,10 +720,11 @@ impl App {
 }
 
 impl Session {
-    fn new(v: Vault, pass: SecretString) -> Self {
+    fn new(v: Vault, id: Identity) -> Self {
         Self {
             v,
-            pass,
+            id,
+            pw_job: None,
             tab: Tab::Codes,
             filter: String::new(),
             shown: HashSet::new(),
@@ -756,9 +780,9 @@ impl App {
                 let path = self.path.clone();
                 let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let r = vault::load(&path, &p).map(|v| {
-                        let _ = session::publish(&path, &p, &v); // общая разблокировка для браузера/CLI
-                        (v, p)
+                    let r = vault::unlock(&path, &p).map(|(v, id)| {
+                        let _ = session::publish(&id); // общая разблокировка для браузера/CLI
+                        (v, id)
                     });
                     let _ = tx.send(r);
                 });
@@ -798,9 +822,17 @@ impl App {
                 } else {
                     let pass = SecretString::from(std::mem::take(p1));
                     p2.zeroize();
-                    let v = Vault::default();
-                    self.saver.submit(&v, &pass);
-                    self.screen = Screen::Open(Box::new(Session::new(v, pass)));
+                    let path = self.path.clone();
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let v = Vault::default();
+                        let r = vault::create(&path, &pass, &v).map(|id| {
+                            let _ = session::publish(&id);
+                            (v, id)
+                        });
+                        let _ = tx.send(r);
+                    });
+                    self.screen = Screen::Unlocking(rx);
                 }
             }
         }
@@ -814,7 +846,7 @@ impl App {
         match import::from_file(p) {
             Ok(v) => {
                 let st = s.v.merge(v);
-                self.saver.submit(&s.v, &s.pass);
+                self.saver.submit(&s.v, &s.id);
                 self.msg(format!("{}: {st}. Исходный файл удали сам (shred -u).", p.display()), GRN);
             }
             Err(e) => self.msg(format!("Импорт: {e}"), RED),
@@ -832,6 +864,19 @@ impl App {
 
         let App { screen, ic, path: vault_path, .. } = self;
         let Screen::Open(s) = screen else { return };
+        if let Some(rx) = &s.pw_job {
+            match rx.try_recv() {
+                Ok(Ok(keep)) => {
+                    s.pw_job = None;
+                    message = Some((format!("Пароль сменён. Ключ под старым паролем сохранён: {}", keep.display()), GRN));
+                }
+                Ok(Err(e)) => {
+                    s.pw_job = None;
+                    message = Some((format!("Пароль не сменён: {e}"), RED));
+                }
+                Err(_) => ctx.request_repaint_after(Duration::from_millis(150)),
+            }
+        }
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1191,21 +1236,22 @@ impl App {
                         });
                         layout_warn(ui, &[&s.np1, &s.np2]);
                         if go {
-                            if s.np0.as_str() != s.pass.expose_secret() {
-                                message = Some(("текущий пароль неверный".into(), RED));
+                            if s.pw_job.is_some() {
+                                message = Some(("смена пароля уже идёт…".into(), YEL));
                             } else if s.np1 != s.np2 {
                                 message = Some(("новые пароли не совпали".into(), RED));
                             } else if s.np1.chars().count() < 10 {
                                 message = Some(("короче 10 символов".into(), RED));
                             } else {
-                                // копия под старым паролем — обычные сохранения её не трогают
-                                let keep = vault_path.with_extension(format!("age.before-passwd-{}", totp::now()));
-                                let _ = std::fs::copy(&*vault_path, &keep);
-                                s.pass = SecretString::from(std::mem::take(&mut s.np1));
-                                s.np0.zeroize();
+                                // перешифровывается только ключ-файл (данные не трогаем); scrypt — в фоне
+                                let old = SecretString::from(std::mem::take(&mut s.np0));
+                                let new = SecretString::from(std::mem::take(&mut s.np1));
                                 s.np2.zeroize();
-                                dirty = true;
-                                message = Some((format!("Пароль сменён. Копия под старым паролем: {}", keep.display()), GRN));
+                                let path = vault_path.clone();
+                                let (tx, rx) = mpsc::channel();
+                                std::thread::spawn(move || { let _ = tx.send(vault::change_password(&path, &old, &new)); });
+                                s.pw_job = Some(rx);
+                                message = Some(("меняю пароль…".into(), YEL));
                             }
                         }
                         ui.add_space(16.0);
@@ -1213,7 +1259,8 @@ impl App {
                         ui.heading("Файлы");
                         ui.label(format!("Хранилище: {}", vault_path.display()));
                         ui.label("Рядом: vault.age.bak — предыдущая версия (после каждого сохранения).");
-                        ui.label("Восстановление без программы: age -d vault.age > vault.json");
+                        ui.label(format!("Ключ: {} — зашифрован паролем. В бэкап — ОБА файла.", vault::key_path(vault_path).display()));
+                        ui.label("Восстановление без программы: age -d -i vault.key.age vault.age > vault.json");
                         ui.label(format!("Автоблокировка: {} мин без действий; буфер обмена чистится через {} с.", AUTOLOCK.as_secs() / 60, CLIP_CLEAR.as_secs()));
                         ui.label("Иконки: Simple Icons (CC0), офлайн, подбираются по имени/issuer/домену. Своя — в карточке записи.");
                         ui.add_space(16.0);
@@ -1273,13 +1320,19 @@ impl App {
             let mut close = false;
             let mut commit = false;
             let mut pick_icon = false;
+            let mut save_btn = false;
+            // ширина формы — по окну: в узком окне подписи над полями, поля на всю ширину
+            let mw = (ctx.content_rect().width() - 40.0).clamp(280.0, 580.0);
+            let narrow = mw < 500.0;
+            let fw = if narrow { mw } else { mw - FORM_LABEL_W - 8.0 };
             egui::Modal::new(egui::Id::unique("pass2fa-edit")).show(ctx, |ui| {
-                ui.set_width(580.0);
+                ui.set_width(mw);
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 110.0).max(120.0)).show(ui, |ui| {
                 match ed {
                     Edit::Code { idx, e, uri, err, show } => {
                         ui.heading(if idx.is_some() { "Изменить 2FA" } else { "Новый 2FA" });
                         ui.label("otpauth:// (из QR) — заполнит поля ниже:");
-                        if ui.add(egui::TextEdit::singleline(uri).desired_width(f32::INFINITY)).changed() {
+                        if ui.add(egui::TextEdit::singleline(uri).desired_width(mw)).changed() {
                             if let Some(p) = totp::parse_otpauth(uri) {
                                 let ip = e.icon_path.take();
                                 *e = p;
@@ -1287,52 +1340,43 @@ impl App {
                                 *err = None;
                             }
                         }
-                        egui::Grid::new("ec").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                            ui.label("Имя"); ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(380.0)); ui.end_row();
-                            ui.label("Issuer"); ui.add(egui::TextEdit::singleline(&mut e.issuer).desired_width(380.0)); ui.end_row();
-                            ui.label("Секрет (base32)"); secret_field(ui, &mut e.secret, show, "", 340.0); ui.end_row();
-                            ui.label("Цифр");
+                        ui.add_space(4.0);
+                        form_row(ui, narrow, "Имя", |ui| { ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(fw)); });
+                        form_row(ui, narrow, "Issuer", |ui| { ui.add(egui::TextEdit::singleline(&mut e.issuer).desired_width(fw)); });
+                        form_row(ui, narrow, "Секрет (base32)", |ui| { secret_field(ui, &mut e.secret, show, "", fw - 44.0); });
+                        form_row(ui, narrow, "Цифр", |ui| {
                             let mut d = e.digits as i64;
                             stepper(ui, &mut d, 6, 9, 1, "");
                             e.digits = d as u32;
-                            ui.end_row();
-                            ui.label("Период, с");
+                        });
+                        form_row(ui, narrow, "Период, с", |ui| {
                             let mut p = e.period as i64;
                             stepper(ui, &mut p, 10, 120, 15, " с");
                             e.period = p as u64;
-                            ui.end_row();
-                            ui.label("Алгоритм");
+                        });
+                        form_row(ui, narrow, "Алгоритм", |ui| {
                             egui::ComboBox::from_id_salt("algo").selected_text(format!("{:?}", e.algorithm)).show_ui(ui, |ui| {
                                 for a in [Algo::SHA1, Algo::SHA256, Algo::SHA512] {
                                     ui.selectable_value(&mut e.algorithm, a, format!("{a:?}"));
                                 }
                             });
-                            ui.end_row();
-                            ui.label("Иконка");
-                            pick_icon |= icon_row(ui, ic, &mut e.icon_path, &[e.issuer.as_str(), e.name.as_str()], &e.name);
-                            ui.end_row();
+                        });
+                        form_row(ui, narrow, "Иконка", |ui| {
+                            pick_icon |= icon_row(ui, ic, &mut e.icon_path, &[e.issuer.as_str(), e.name.as_str()], &e.name, fw);
                         });
                         if let Some(er) = err { ui.colored_label(RED, er.as_str()); }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button(format!("{CHECK} Сохранить")).clicked() {
-                                e.secret = e.secret.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
-                                if e.name.trim().is_empty() { *err = Some("нужно имя".into()); }
-                                else if totp::base32_decode(&e.secret).is_none() { *err = Some("секрет не base32".into()); }
-                                else { commit = true; }
-                            }
-                            if ui.button(format!("{X} Отмена")).clicked() { close = true; }
-                        });
                     }
                     Edit::Login { idx, e, show } => {
                         ui.heading(if idx.is_some() { "Изменить пароль" } else { "Новый пароль" });
-                        egui::Grid::new("el").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                            ui.label("Имя"); ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(380.0)); ui.end_row();
-                            ui.label("URL"); ui.add(egui::TextEdit::singleline(&mut e.url).desired_width(380.0)); ui.end_row();
-                            ui.label("Логин"); ui.add(egui::TextEdit::singleline(&mut e.username).desired_width(380.0)); ui.end_row();
-                            ui.label("Пароль"); secret_field(ui, &mut e.password, show, "", 340.0); ui.end_row();
-                            ui.label("");
-                            ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        form_row(ui, narrow, "Имя", |ui| { ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(fw)); });
+                        form_row(ui, narrow, "URL", |ui| { ui.add(egui::TextEdit::singleline(&mut e.url).desired_width(fw)); });
+                        form_row(ui, narrow, "Логин", |ui| { ui.add(egui::TextEdit::singleline(&mut e.username).desired_width(fw)); });
+                        form_row(ui, narrow, "Пароль", |ui| { secret_field(ui, &mut e.password, show, "", fw - 44.0); });
+                        form_row(ui, narrow, "", |ui| {
+                            // генератор переносится на новую строку, если не влезает
+                            ui.horizontal_wrapped(|ui| {
+                                ui.set_max_width(fw);
                                 let mut n = s.gen.len as i64;
                                 stepper(ui, &mut n, 8, 128, 1, " симв.");
                                 s.gen.len = n as usize;
@@ -1345,10 +1389,10 @@ impl App {
                                     *show = true;
                                 }
                             });
-                            ui.end_row();
-                            ui.label("Группа");
+                        });
+                        form_row(ui, narrow, "Группа", |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut e.group).hint_text("без группы").desired_width(250.0));
+                                ui.add(egui::TextEdit::singleline(&mut e.group).hint_text("без группы").desired_width(fw - 64.0));
                                 egui::ComboBox::from_id_salt("edit_grp").selected_text(FOLDER).width(40.0).show_ui(ui, |ui| {
                                     if ui.selectable_label(e.group.is_empty(), "Без группы").clicked() { e.group.clear(); }
                                     for g in s.v.all_groups() {
@@ -1357,20 +1401,34 @@ impl App {
                                     }
                                 });
                             });
-                            ui.end_row();
-                            ui.label("Заметка"); ui.add(egui::TextEdit::multiline(&mut e.note).desired_rows(2).desired_width(380.0)); ui.end_row();
-                            ui.label("Иконка");
-                            pick_icon |= icon_row(ui, ic, &mut e.icon, &[e.url.as_str(), e.name.as_str()], &e.name);
-                            ui.end_row();
                         });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button(format!("{CHECK} Сохранить")).clicked() && !e.name.trim().is_empty() { commit = true; }
-                            if ui.button(format!("{X} Отмена")).clicked() { close = true; }
+                        form_row(ui, narrow, "Заметка", |ui| { ui.add(egui::TextEdit::multiline(&mut e.note).desired_rows(2).desired_width(fw)); });
+                        form_row(ui, narrow, "Иконка", |ui| {
+                            pick_icon |= icon_row(ui, ic, &mut e.icon, &[e.url.as_str(), e.name.as_str()], &e.name, fw);
                         });
                     }
                 }
+                });
+                // кнопки — вне прокрутки, всегда видны
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{CHECK} Сохранить")).clicked() { save_btn = true; }
+                    if ui.button(format!("{X} Отмена")).clicked() { close = true; }
+                });
             });
+            if save_btn {
+                match ed {
+                    Edit::Code { e, err, .. } => {
+                        e.secret = e.secret.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+                        if e.name.trim().is_empty() { *err = Some("нужно имя".into()); }
+                        else if totp::base32_decode(&e.secret).is_none() { *err = Some("секрет не base32".into()); }
+                        else { commit = true; }
+                    }
+                    Edit::Login { e, .. } => {
+                        if !e.name.trim().is_empty() { commit = true; }
+                    }
+                }
+            }
             if pick_icon {
                 s.picker = Some(Picker::open(Purpose::Icon, icons::FILE_EXTS, None));
             }
@@ -1427,7 +1485,7 @@ impl App {
             }
         }
 
-        if dirty { self.saver.submit(&s.v, &s.pass); }
+        if dirty { self.saver.submit(&s.v, &s.id); }
         if let Some((m, c)) = message { self.msg(m, c); }
         if let Some((t, w)) = to_copy { self.copy(ctx, &t, w); }
         if let Some(p) = import_req { self.do_import(&p); }
@@ -1437,13 +1495,13 @@ impl App {
 
 /// Строка «Иконка» в карточке: превью, поле (пусто = авто, si:slug, путь), выбор файла, сброс.
 /// Возвращает true, если нажали «выбрать файл».
-fn icon_row(ui: &mut egui::Ui, ic: &mut IconCache, field: &mut Option<String>, cands: &[&str], name: &str) -> bool {
+fn icon_row(ui: &mut egui::Ui, ic: &mut IconCache, field: &mut Option<String>, cands: &[&str], name: &str, width: f32) -> bool {
     let mut pick = false;
     ui.horizontal(|ui| {
         ic.paint(ui, field.as_deref(), cands, name, 26.0);
         let mut t = field.clone().unwrap_or_default();
         let auto = icons::find(cands).map(|s| format!("авто: si:{}", s.slug)).unwrap_or("авто: буква".into());
-        if ui.add(egui::TextEdit::singleline(&mut t).hint_text(auto).desired_width(230.0)).changed() {
+        if ui.add(egui::TextEdit::singleline(&mut t).hint_text(auto).desired_width((width - 26.0 - 2.0 * 36.0 - 20.0).max(80.0))).changed() {
             *field = if t.trim().is_empty() { None } else { Some(t) };
         }
         if ui.button(format!("{IMAGE}")).on_hover_text("выбрать SVG/PNG/JPEG/ICO/WebP").clicked() { pick = true; }

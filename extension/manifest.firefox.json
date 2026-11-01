@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "pass2fa",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Заполнение логинов и TOTP из локального pass2fa (native messaging, без сети и аккаунтов)",
   "browser_specific_settings": {
     "gecko": {

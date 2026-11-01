@@ -18,7 +18,12 @@ async function targetTab() {
   // ?tab=<id> — для автотестов, когда popup открыт как вкладка
   const t = new URLSearchParams(location.search).get("tab");
   if (t) return api.tabs.get(Number(t));
-  const [x] = await api.tabs.query({ active: true, currentWindow: true });
+  // вкладка последнего активного окна браузера (в Firefox/LibreWolf currentWindow из popup бывает не тем)
+  let [x] = await api.tabs.query({ active: true, lastFocusedWindow: true });
+  if (!x || /^(moz-extension|chrome-extension):/.test(x.url || "")) {
+    const all = await api.tabs.query({ active: true, windowType: "normal" });
+    x = all.find((t) => /^https?:/.test(t.url || "")) || all[0] || x;
+  }
   return x;
 }
 

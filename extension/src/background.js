@@ -3,7 +3,7 @@
 if (typeof importScripts === "function") importScripts("common.js"); // Chromium service worker
 
 async function activeTab() {
-  const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await api.tabs.query({ active: true, lastFocusedWindow: true });
   return tabWithUrl(tab);
 }
 

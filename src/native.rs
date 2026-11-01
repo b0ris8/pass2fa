@@ -57,7 +57,7 @@ fn err(m: impl Into<String>) -> Value {
 
 pub fn handle(vault_path: &Path, req: &Value) -> Value {
     match req.get("op").and_then(Value::as_str).unwrap_or("") {
-        "status" => json!({ "ok": true, "unlocked": session::passphrase().is_some(), "supported": session::supported() }),
+        "status" => json!({ "ok": true, "unlocked": session::is_unlocked(), "supported": session::supported() }),
         "lock" => {
             session::clear();
             json!({ "ok": true })
@@ -65,8 +65,8 @@ pub fn handle(vault_path: &Path, req: &Value) -> Value {
         "unlock" => {
             let Some(p) = req.get("password").and_then(Value::as_str) else { return err("нет пароля") };
             let pass = SecretString::from(p.to_string());
-            match vault::load(vault_path, &pass) {
-                Ok(v) => match session::publish(vault_path, &pass, &v) {
+            match vault::unlock(vault_path, &pass) {
+                Ok((_, id)) => match session::publish(&id) {
                     Ok(()) => json!({ "ok": true }),
                     Err(e) => err(e),
                 },
@@ -75,26 +75,62 @@ pub fn handle(vault_path: &Path, req: &Value) -> Value {
         }
         "get" => {
             let Some(url) = req.get("url").and_then(Value::as_str) else { return err("нет url") };
-            let Some(host) = icons::host(url).or_else(|| url.split("://").nth(1).map(|h| h.split(['/', ':']).next().unwrap_or("").to_lowercase())) else {
-                return err("не разобрал хост");
-            };
+            let Some(tab) = endpoint(url) else { return err("не разобрал адрес") };
             match session::load(vault_path) {
                 Ok(None) => json!({ "ok": false, "locked": true }),
                 Err(e) => err(e),
-                Ok(Some(v)) => found(&v, &host),
+                Ok(Some((v, _))) => found(&v, &tab),
             }
         }
         other => err(format!("неизвестная операция: {other}")),
     }
 }
 
-fn found(v: &Vault, host: &str) -> Value {
-    let logins: Vec<Value> = v
+/// Хост и порт из адреса. Порт: явный, иначе стандартный для схемы (https 443, http 80);
+/// без схемы и без порта — None (совпадает с любым портом).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+pub fn endpoint(url: &str) -> Option<Endpoint> {
+    let u = url.trim();
+    let (scheme, rest) = match u.split_once("://") {
+        Some((s, r)) => (Some(s.to_lowercase()), r),
+        None => (None, u),
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?; // user:pass@host
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (h, p.parse::<u16>().ok()),
+        _ => (authority, None),
+    };
+    let host = host.trim_start_matches("www.").to_lowercase();
+    if host.is_empty() || !host.contains('.') && host != "localhost" {
+        return None;
+    }
+    let port = port.or(match scheme.as_deref() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    });
+    Some(Endpoint { host, port })
+}
+
+fn found(v: &Vault, tab: &Endpoint) -> Value {
+    // (точное совпадение хоста+порта — первым, затем поддомены)
+    let mut hits: Vec<(u8, &LoginEntry)> = v
         .passwords
         .iter()
-        .filter(|l| login_matches(l, host))
-        .map(|l| json!({ "name": l.name, "username": l.username, "password": l.password, "group": l.group }))
+        .filter_map(|l| entry_endpoint(l).and_then(|e| endpoint_rank(&e, tab)).map(|r| (r, l)))
         .collect();
+    hits.sort_by_key(|(r, l)| (*r, l.name.to_lowercase()));
+    let logins: Vec<Value> = hits
+        .into_iter()
+        .map(|(_, l)| json!({ "name": l.name, "username": l.username, "password": l.password, "group": l.group }))
+        .collect();
+    let host = &tab.host;
     let now = totp::now();
     let codes: Vec<Value> = v
         .codes
@@ -107,15 +143,33 @@ fn found(v: &Vault, host: &str) -> Value {
             Some(json!({ "name": c.name, "code": code, "left": left, "next": next, "period": c.period }))
         })
         .collect();
-    json!({ "ok": true, "host": host, "logins": logins, "totp": codes })
+    let shown = match tab.port {
+        Some(443) | Some(80) | None => host.clone(),
+        Some(p) => format!("{host}:{p}"),
+    };
+    json!({ "ok": true, "host": shown, "logins": logins, "totp": codes })
 }
 
-/// Хост записи: из URL, иначе из имени, если оно похоже на домен (CSV часто кладёт домен в name).
-fn entry_host(l: &LoginEntry) -> Option<String> {
-    icons::host(&l.url).or_else(|| {
-        let n = l.name.trim().to_lowercase();
-        (n.contains('.') && !n.contains(' ') && !n.contains('@')).then(|| n.trim_start_matches("www.").to_string())
+/// Адрес записи: из URL, иначе из имени, если оно похоже на домен (CSV часто кладёт домен в name).
+fn entry_endpoint(l: &LoginEntry) -> Option<Endpoint> {
+    endpoint(&l.url).or_else(|| {
+        let n = l.name.trim();
+        (n.contains('.') && !n.contains(' ') && !n.contains('@')).then(|| endpoint(n)).flatten()
     })
+}
+
+/// 0 — тот же хост и порт, 1 — поддомен сохранённого; None — не подходит.
+/// Порт обязан совпасть, если он известен у обоих (dev1step.com:6493 ≠ dev1step.com).
+fn endpoint_rank(saved: &Endpoint, tab: &Endpoint) -> Option<u8> {
+    if let (Some(a), Some(b)) = (saved.port, tab.port) {
+        if a != b {
+            return None;
+        }
+    }
+    if !host_matches(&saved.host, &tab.host) {
+        return None;
+    }
+    Some(if saved.host == tab.host { 0 } else { 1 })
 }
 
 /// Точное совпадение или вкладка — поддомен сохранённого хоста (по границе метки).
@@ -123,10 +177,6 @@ fn entry_host(l: &LoginEntry) -> Option<String> {
 pub fn host_matches(saved: &str, tab: &str) -> bool {
     let (s, t) = (saved.trim_start_matches("www."), tab.trim_start_matches("www."));
     !s.is_empty() && (s == t || t.ends_with(&format!(".{s}")))
-}
-
-fn login_matches(l: &LoginEntry, host: &str) -> bool {
-    entry_host(l).is_some_and(|h| host_matches(&h, host))
 }
 
 /// TOTP без URL: совпадение по метке домена второго уровня (github.com → «github») в issuer/имени.
@@ -243,15 +293,34 @@ mod tests {
         c.issuer = "GitHub".into();
         v.codes.push(c);
         v.codes.push(TotpEntry::new("Google (me)", "GEZDGNBVGY3TQOJQ"));
-        let r = found(&v, "github.com");
+        let ep = |u: &str| endpoint(u).unwrap();
+        let r = found(&v, &ep("https://github.com/login"));
         assert_eq!(r["logins"].as_array().unwrap().len(), 1);
         assert_eq!(r["totp"].as_array().unwrap().len(), 1);
-        let r = found(&v, "accounts.google.com");
+        let r = found(&v, &ep("https://accounts.google.com/x"));
         assert_eq!(r["logins"].as_array().unwrap().len(), 1);
         assert_eq!(r["logins"][0]["name"], "accounts.google.com");
         assert_eq!(r["totp"].as_array().unwrap().len(), 1);
-        let r = found(&v, "gist.github.com");
+        let r = found(&v, &ep("https://gist.github.com/"));
         assert_eq!(r["logins"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ports() {
+        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: name.into(), password: "p".into(), note: String::new(), icon: None, group: String::new() };
+        let mut v = Vault::default();
+        v.passwords.push(mk("grafana", "https://dev1step.com:6493/login"));
+        v.passwords.push(mk("apache", "https://dev1step.com/"));
+        v.passwords.push(mk("jupyter", "https://dev1step.com:8888"));
+        let names = |u: &str| -> Vec<String> {
+            found(&v, &endpoint(u).unwrap())["logins"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(names("https://dev1step.com:6493/login"), vec!["grafana"]);
+        assert_eq!(names("https://dev1step.com/admin"), vec!["apache"]);
+        assert_eq!(names("https://dev1step.com:443/"), vec!["apache"]); // явный стандартный порт = без порта
+        assert_eq!(names("http://dev1step.com:8888/lab"), vec!["jupyter"]);
+        assert!(names("https://dev1step.com:9999/").is_empty());
+        assert_eq!(endpoint("https://user:pw@Example.COM:8443/x").unwrap(), Endpoint { host: "example.com".into(), port: Some(8443) });
     }
 
     #[test]
