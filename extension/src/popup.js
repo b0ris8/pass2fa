@@ -81,10 +81,10 @@ async function load() {
 }
 
 async function main() {
-  tab = await targetTab();
+  tab = await tabWithUrl(await targetTab());
   host = tab && tabHost(tab.url);
   $("host").textContent = host || "эта страница не поддерживается";
-  if (!host) return;
+  if (!host) return msg(whyUnsupported(tab), true);
   if (!protocolAllowed(tab.url)) msg("заполнение только на https; копировать можно", true);
   await load();
 }

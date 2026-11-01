@@ -94,6 +94,28 @@ function pageFillTotp(expectHost, code) {
   return { ok: true, filled: ["код"] };
 }
 
+// Firefox/LibreWolf без права "tabs" не отдают tab.url даже активной вкладки — читаем адрес из
+// самой страницы (это разрешено тем же activeTab после клика по значку/хоткея).
+async function tabWithUrl(tab) {
+  if (!tab || tab.url) return tab;
+  try {
+    const [res] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: () => location.href });
+    if (res?.result) return { ...tab, url: res.result };
+  } catch (e) {
+    return { ...tab, urlError: String(e?.message ?? e) };
+  }
+  return tab;
+}
+
+// почему страница недоступна — человеческим языком
+function whyUnsupported(tab) {
+  const u = tab?.url || "";
+  if (/^(about|moz-extension|chrome|chrome-extension|edge|view-source|resource):/.test(u)) return "служебная страница браузера — сюда расширениям нельзя";
+  if (/^https?:\/\/(addons\.mozilla\.org|chromewebstore\.google\.com|chrome\.google\.com\/webstore)/.test(u)) return "магазин дополнений — браузер запрещает расширениям доступ к нему";
+  if (!u) return "браузер не сообщил адрес вкладки" + (tab?.urlError ? ": " + tab.urlError : "");
+  return "не http/https: " + u.split(":")[0];
+}
+
 async function fillInTab(tab, func, args) {
   if (!protocolAllowed(tab.url)) return { ok: false, error: "заполняю только на https (или localhost)" };
   try {
@@ -101,7 +123,9 @@ async function fillInTab(tab, func, args) {
     const [res] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func, args });
     return res?.result ?? { ok: false, error: "нет результата" };
   } catch (e) {
-    return { ok: false, error: "нет доступа к странице: " + (e?.message ?? e) };
+    const why = /addons\.mozilla\.org|Missing host permission|cannot be scripted|restricted/i.test(String(e?.message ?? e))
+      ? "браузер запрещает доступ к этой странице (магазин дополнений / служебная)" : String(e?.message ?? e);
+    return { ok: false, error: "нет доступа к странице: " + why };
   }
 }
 

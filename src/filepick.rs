@@ -36,23 +36,13 @@ fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
-fn state_file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("pass2fa").join("state.json"))
-}
-
 fn load_last_dir() -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(state_file()?).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let p = PathBuf::from(v.get("last_dir")?.as_str()?);
+    let p = PathBuf::from(crate::state::get("last_dir")?.as_str()?);
     p.is_dir().then_some(p)
 }
 
 fn save_last_dir(d: &Path) {
-    let Some(f) = state_file() else { return };
-    if let Some(parent) = f.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&f, serde_json::json!({ "last_dir": d.display().to_string() }).to_string());
+    crate::state::set("last_dir", serde_json::json!(d.display().to_string()));
 }
 
 fn expand(p: &str) -> PathBuf {

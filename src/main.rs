@@ -8,6 +8,7 @@ mod import;
 mod model;
 mod native;
 mod session;
+mod state;
 mod totp;
 mod vault;
 

@@ -87,7 +87,7 @@ pub fn run(path: PathBuf) -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions {
         viewport: vp
-            .with_inner_size([1120.0, 720.0])
+            .with_inner_size(crate::state::window_size().unwrap_or([1120.0, 720.0]))
             .with_min_inner_size([520.0, 420.0]),
         ..Default::default()
     };
@@ -278,6 +278,8 @@ struct App {
     last_input: Instant,
     clip_at: Option<Instant>,
     ic: IconCache,
+    /// текущий размер окна (логические пиксели) — пишется в state.json при выходе
+    win_size: Option<[f32; 2]>,
     #[cfg(feature = "devshot")]
     frames: u32,
 }
@@ -350,8 +352,8 @@ fn groups_panel(ui: &mut egui::Ui, s: &mut Session, act: &mut Option<GroupAct>, 
         item(ui, Some(String::new()), format!("{FOLDER} Без группы"), none_cnt, Some(String::new()));
         ui.add_space(8.0);
         if let Some(ng) = &mut s.new_group {
-            let r = ui.add(egui::TextEdit::singleline(ng).hint_text("имя группы + Enter").desired_width(f32::INFINITY));
-            r.request_focus();
+            let r = ui.add(egui::TextEdit::singleline(ng).id(egui::Id::unique("pass2fa-new-group")).hint_text("имя группы + Enter").desired_width(f32::INFINITY));
+            focus_if_free(&r);
             if enter(&r) {
                 if !ng.trim().is_empty() { *act = Some(GroupAct::Add(ng.trim().to_string())); }
                 s.new_group = None;
@@ -361,8 +363,8 @@ fn groups_panel(ui: &mut egui::Ui, s: &mut Session, act: &mut Option<GroupAct>, 
         }
         if let Some((old, new)) = &mut s.rename_group {
             ui.label(RichText::new(format!("Переименовать «{old}»")).small().color(SUB));
-            let r = ui.add(egui::TextEdit::singleline(new).desired_width(f32::INFINITY));
-            r.request_focus();
+            let r = ui.add(egui::TextEdit::singleline(new).id(egui::Id::unique("pass2fa-rename-group")).desired_width(f32::INFINITY));
+            focus_if_free(&r);
             if enter(&r) {
                 if !new.trim().is_empty() && new.trim() != old { *act = Some(GroupAct::Rename(old.clone(), new.trim().to_string())); }
                 s.rename_group = None;
@@ -423,8 +425,17 @@ fn secret_field(ui: &mut egui::Ui, text: &mut String, show: &mut bool, hint: &st
     .inner
 }
 
+/// Enter в однострочном поле: поле в фокусе (или только что его отдало) и в этом кадре нажат Enter.
 fn enter(r: &egui::Response) -> bool {
-    r.lost_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter))
+    (r.has_focus() || r.lost_focus()) && r.ctx.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+/// Фокус в поле — только если сейчас ничего не в фокусе (иначе поле каждый кадр перехватывает фокус
+/// и Enter теряется).
+fn focus_if_free(r: &egui::Response) {
+    if !r.has_focus() && r.ctx.memory(|m| m.focused().is_none()) {
+        r.request_focus();
+    }
 }
 
 fn arrow(ui: &mut egui::Ui, tip: &str) -> bool {
@@ -497,6 +508,7 @@ impl App {
             status: None,
             last_input: Instant::now(),
             clip_at: None,
+            win_size: None,
             #[cfg(feature = "devshot")]
             frames: 0,
         }
@@ -534,6 +546,13 @@ impl eframe::App for App {
         let ctx = &ui.ctx().clone();
         #[cfg(feature = "devshot")]
         self.devshot(ctx);
+        // размер окна: точки egui × zoom = логические пиксели (в них же его задаёт with_inner_size)
+        // (inner_rect на Wayland пустой — позиция окна неизвестна; viewport_rect позиции не требует)
+        let r = ctx.viewport_rect();
+        if r.width() > 1.0 {
+            let z = ctx.zoom_factor();
+            self.win_size = Some([r.width() * z, r.height() * z]);
+        }
         let active = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving());
         if active { self.last_input = Instant::now(); }
         if matches!(self.screen, Screen::Open(_)) {
@@ -605,6 +624,25 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.saver.finish(); // дождаться последней записи
+        if let Some(sz) = self.win_size {
+            crate::state::set_window_size(sz);
+        }
+    }
+
+    /// devshot: имитация клавиатуры (для проверки ввода групп и т.п.)
+    #[cfg(feature = "devshot")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if std::env::var("PASS2FA_DEV_TAB").as_deref() != Ok("newgroup") || !matches!(self.screen, Screen::Open(_)) {
+            return;
+        }
+        raw.focused = true; // в headless-композиторе окно не получает фокус ОС
+        let key = |k, pressed| egui::Event::Key { key: k, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+        match self.frames {
+            15 => raw.events.push(egui::Event::Text("Новая группа".into())),
+            20 => raw.events.push(key(egui::Key::Enter, true)),
+            21 => raw.events.push(key(egui::Key::Enter, false)),
+            _ => {}
+        }
     }
 }
 
@@ -632,6 +670,14 @@ impl App {
                 Ok("settings") => s.tab = Tab::Settings,
                 Ok("edit") if s.edit.is_none() => s.edit = Some(Edit::Login { idx: Some(0), e: s.v.passwords[0].clone(), show: false }),
                 Ok("picker") if s.picker.is_none() => s.picker = Some(Picker::open(Purpose::Import, &["csv", "json", "txt"], None)),
+                Ok("gen") if self.frames == 8 => {
+                    s.tab = Tab::Logins;
+                    s.gen_last = gen::generate(&s.gen);
+                }
+                Ok("newgroup") if self.frames == 8 => {
+                    s.tab = Tab::Logins;
+                    s.new_group = Some(String::new());
+                }
                 Ok("editcode") if s.edit.is_none() => s.edit = Some(Edit::Code { idx: Some(0), e: s.v.codes[0].clone(), uri: String::new(), err: None, show: false }),
                 _ => {}
             }
@@ -927,9 +973,12 @@ impl App {
                             ui.checkbox(&mut s.gen.upper, "A-Z");
                             ui.checkbox(&mut s.gen.digits, "0-9");
                             ui.checkbox(&mut s.gen.symbols, "!#$");
+                        });
+                        // результат — отдельной строкой под кнопками, чтобы не обрезался в узком окне
+                        ui.horizontal(|ui| {
                             if !s.gen_last.is_empty() {
-                                ui.separator();
-                                let t = if s.gen_show { s.gen_last.clone() } else { "•".repeat(s.gen_last.chars().count().min(16)) };
+                                ui.label(RichText::new("последний:").small().color(SUB));
+                                let t = if s.gen_show { s.gen_last.clone() } else { "•".repeat(s.gen_last.chars().count().min(24)) };
                                 ui.add(egui::Label::new(RichText::new(t).monospace().color(N8)).truncate());
                                 if ui.small_button(if s.gen_show { EYE_OFF } else { EYE }).clicked() { s.gen_show = !s.gen_show; }
                                 if ui.small_button(COPY).on_hover_text("скопировать ещё раз").clicked() {

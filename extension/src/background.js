@@ -4,7 +4,7 @@ if (typeof importScripts === "function") importScripts("common.js"); // Chromium
 
 async function activeTab() {
   const [tab] = await api.tabs.query({ active: true, currentWindow: true });
-  return tab;
+  return tabWithUrl(tab);
 }
 
 async function openPopup() {
