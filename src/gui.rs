@@ -47,6 +47,7 @@ pub mod icon {
     pub const RESET: &str = "\u{e038}";
     pub const MINUS: &str = "\u{e32a}";
     pub const RECENT: &str = "\u{e1a0}";
+    pub const OPEN_OUT: &str = "\u{e5de}";
 }
 use icon::*;
 
@@ -445,6 +446,38 @@ fn stepper(ui: &mut egui::Ui, v: &mut i64, min: i64, max: i64, step: i64, suffix
 }
 
 /// Поле секрета с кнопкой «глаз». Возвращает ответ TextEdit.
+/// Адрес для открытия: URL записи, иначе имя, если похоже на домен; без схемы — https://.
+fn site_url(url: &str, name: &str) -> Option<String> {
+    let u = url.trim();
+    let n = name.trim();
+    let raw = if !u.is_empty() { u } else if n.contains('.') && !n.contains(' ') && !n.contains('@') { n } else { return None };
+    crate::native::endpoint(raw)?;
+    Some(if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") })
+}
+
+/// Открыть адрес в браузере по умолчанию: $BROWSER, затем xdg-open, затем librewolf/firefox. Только http(s).
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let low = url.to_lowercase();
+    if !(low.starts_with("https://") || low.starts_with("http://")) {
+        return Err(format!("не http(s): {url}"));
+    }
+    let mut cands: Vec<String> = std::env::var("BROWSER").map(|b| b.split(':').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default();
+    cands.extend(["xdg-open", "librewolf", "firefox"].map(String::from));
+    for c in cands {
+        if let Ok(mut ch) = std::process::Command::new(&c)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            std::thread::spawn(move || { let _ = ch.wait(); }); // без зомби
+            return Ok(());
+        }
+    }
+    Err("не нашёл браузер ($BROWSER, xdg-open, librewolf, firefox)".into())
+}
+
 fn secret_field(ui: &mut egui::Ui, text: &mut String, show: &mut bool, hint: &str, width: f32) -> egui::Response {
     ui.horizontal(|ui| {
         let r = ui.add(
@@ -876,6 +909,7 @@ impl App {
         let ctx = &ui.ctx().clone();
         let mut want_lock = false;
         let mut to_copy: Option<(String, &'static str)> = None;
+        let mut open_url: Option<String> = None;
         let mut dirty = false;
         let mut import_req: Option<PathBuf> = None;
         let mut message: Option<(String, Color32)> = None;
@@ -1099,7 +1133,7 @@ impl App {
                                         // в совсем узком — остаются только кнопки (текст логина/пароля скрыт)
                                         let aw = ui.available_width();
                                         let (user_w, pass_w) = if aw > 900.0 { (230.0, 150.0) } else if aw > 680.0 { (150.0, 100.0) } else { (0.0, 0.0) };
-                                        let right = user_w + 34.0 + pass_w + if pass_w > 0.0 { 2.0 } else { 1.0 } * 34.0 + 2.0 * 34.0 + 40.0;
+                                        let right = 34.0 + user_w + 34.0 + pass_w + if pass_w > 0.0 { 2.0 } else { 1.0 } * 34.0 + 2.0 * 34.0 + 40.0;
                                         let name_w = (aw - right).max(80.0);
                                         let sub = icons::host(&l.url).unwrap_or_else(|| l.url.clone());
                                         let sub = (!sub.is_empty() && sub != l.name.trim_start_matches("www.")).then_some(sub);
@@ -1153,6 +1187,13 @@ impl App {
                                             }
                                         });
                                         let l = &s.v.passwords[i];
+                                        let site = site_url(&l.url, &l.name);
+                                        let r = ui.add_enabled(site.is_some(), egui::Button::new(OPEN_OUT));
+                                        if let Some(u) = &site {
+                                            if r.on_hover_text(format!("открыть в браузере: {u}")).clicked() {
+                                                open_url = Some(u.clone());
+                                            }
+                                        }
                                         if user_w > 0.0 {
                                             ui.allocate_ui_with_layout(Vec2::new(user_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
                                                 ui.set_min_width(user_w);
@@ -1411,7 +1452,18 @@ impl App {
                         ui.heading(if idx.is_some() { "Изменить пароль" } else { "Новый пароль" });
                         ui.add_space(4.0);
                         form_row(ui, narrow, "Имя", |ui| { ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(fw)); });
-                        form_row(ui, narrow, "URL", |ui| { ui.add(egui::TextEdit::singleline(&mut e.url).desired_width(fw)); });
+                        form_row(ui, narrow, "URL", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut e.url).hint_text("https://…").desired_width(fw - 80.0));
+                                let site = site_url(&e.url, "");
+                                if ui.add_enabled(!e.url.trim().is_empty(), egui::Button::new(COPY)).on_hover_text("копировать адрес").clicked() {
+                                    to_copy = Some((e.url.trim().to_string(), "Адрес"));
+                                }
+                                if ui.add_enabled(site.is_some(), egui::Button::new(OPEN_OUT)).on_hover_text("открыть в браузере").clicked() {
+                                    open_url = site;
+                                }
+                            });
+                        });
                         form_row(ui, narrow, "Доп. сайты", |ui| {
                             ui.add(egui::TextEdit::multiline(sites).desired_rows(1).hint_text("ещё адреса, по одному на строку").desired_width(fw));
                         });
@@ -1534,6 +1586,12 @@ impl App {
         if dirty { self.saver.submit(&s.v, &s.id); }
         if let Some((m, c)) = message { self.msg(m, c); }
         if let Some((t, w)) = to_copy { self.copy(ctx, &t, w); }
+        if let Some(u) = open_url {
+            match open_in_browser(&u) {
+                Ok(()) => self.msg(format!("{OPEN_OUT} {u}"), GRN),
+                Err(e) => self.msg(e, RED),
+            }
+        }
         if let Some(p) = import_req { self.do_import(&p); }
         if want_lock { self.lock(true); }
     }
