@@ -1,0 +1,3 @@
+assets/simple-icons.tsv.z — данные Simple Icons 16.36.0 (https://simpleicons.org), лицензия CC0-1.0.
+Формат: zlib(deflate) от TSV: slug \t hex \t ключи_поиска(через пробел) \t SVG path (viewBox 0 0 24 24).
+Торговые марки принадлежат владельцам (см. DISCLAIMER Simple Icons). Генератор: tools/gen-simple-icons.py (npm pack simple-icons; python3 tools/gen-simple-icons.py package)

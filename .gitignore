@@ -1,0 +1,7 @@
+/target/
+# открытые секреты и хранилище — никогда в git
+*.csv
+*.json
+*.age
+*.age.bak
+*.age.tmp

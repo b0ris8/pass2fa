@@ -1,0 +1,114 @@
+mod export;
+mod filepick;
+mod gen;
+mod icons;
+mod gui;
+mod import;
+mod model;
+mod totp;
+mod vault;
+
+use age::secrecy::SecretString;
+use std::path::PathBuf;
+
+const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-шифрование)
+
+  pass2fa                          GUI
+  pass2fa import <файл>...         импорт JSON/CSV/otpauth в хранилище (создаст его при отсутствии)
+  pass2fa code <подстрока имени>   напечатать текущий TOTP-код (для скриптов: | wl-copy)
+  pass2fa export-aegis <файл>      2FA в открытый JSON для импорта в Aegis (после переноса удалить!)
+  pass2fa export-passvault <файл>  пароли в открытый JSON для PassVault (после переноса удалить!)
+
+  --vault <путь>   файл хранилища (иначе $PASS2FA_VAULT или ~/.local/share/2FApass/vault.age)
+  Восстановление без программы:  age -d vault.age";
+
+fn main() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut path = vault::default_path();
+    if let Some(i) = args.iter().position(|a| a == "--vault") {
+        if i + 1 >= args.len() { die("--vault: нужен путь"); }
+        path = PathBuf::from(args.remove(i + 1));
+        args.remove(i);
+    }
+    let r = match args.first().map(String::as_str) {
+        None => gui::run(path).map_err(|e| e.to_string()),
+        Some("import") if args.len() > 1 => cli_import(&path, &args[1..]),
+        Some("code") if args.len() == 2 => cli_code(&path, &args[1]),
+        Some("export-aegis") if args.len() == 2 => cli_export_aegis(&path, &args[1]),
+        Some("export-passvault") if args.len() == 2 => cli_export_passvault(&path, &args[1]),
+        Some("-h" | "--help" | "help") => { println!("{USAGE}"); Ok(()) }
+        _ => Err(USAGE.to_string()),
+    };
+    if let Err(e) = r { die(&e); }
+}
+
+fn die(e: &str) -> ! {
+    eprintln!("{e}");
+    std::process::exit(1)
+}
+
+fn ask(prompt: &str) -> Result<SecretString, String> {
+    rpassword::prompt_password(prompt).map(SecretString::from).map_err(|e| e.to_string())
+}
+
+fn open_or_create(path: &PathBuf) -> Result<(model::Vault, SecretString), String> {
+    use age::secrecy::ExposeSecret;
+    if vault::exists(path) {
+        let p = ask("Пароль хранилища: ")?;
+        let v = vault::load(path, &p)?;
+        Ok((v, p))
+    } else {
+        eprintln!("Хранилища {} нет — создаю.", path.display());
+        let p1 = ask("Новый пароль: ")?;
+        let p2 = ask("Повтор: ")?;
+        if p1.expose_secret() != p2.expose_secret() { return Err("пароли не совпали".into()); }
+        if p1.expose_secret().chars().count() < 10 { return Err("пароль короче 10 символов".into()); }
+        Ok((model::Vault::default(), p1))
+    }
+}
+
+fn cli_import(path: &PathBuf, files: &[String]) -> Result<(), String> {
+    let (mut v, pass) = open_or_create(path)?;
+    for f in files {
+        let st = v.merge(import::from_file(std::path::Path::new(f))?);
+        eprintln!("{f}: {st}");
+    }
+    vault::save(path, &pass, &v)?;
+    eprintln!("Сохранено: {} (2FA: {}, паролей: {})", path.display(), v.codes.len(), v.passwords.len());
+    eprintln!("Исходные открытые файлы удали сам (shred -u <файл>), после проверки в GUI.");
+    Ok(())
+}
+
+fn cli_code(path: &PathBuf, needle: &str) -> Result<(), String> {
+    let pass = ask("Пароль хранилища: ")?;
+    let v = vault::load(path, &pass)?;
+    let n = needle.to_lowercase();
+    let hits: Vec<_> = v.codes.iter().filter(|c| c.name.to_lowercase().contains(&n)).collect();
+    match hits.as_slice() {
+        [one] => {
+            let (code, _) = totp::code(one).ok_or("битый секрет")?;
+            println!("{code}");
+            Ok(())
+        }
+        [] => Err("не найдено".into()),
+        many => Err(format!("неоднозначно: {}", many.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))),
+    }
+}
+
+fn cli_export_aegis(path: &PathBuf, out: &str) -> Result<(), String> {
+    let pass = ask("Пароль хранилища: ")?;
+    let v = vault::load(path, &pass)?;
+    let n = export::aegis_to_file(&v, std::path::Path::new(out))?;
+    eprintln!("{n} записей 2FA -> {out} (ОТКРЫТЫЙ ТЕКСТ). Aegis: Настройки → Импорт и экспорт → Импорт из файла → Aegis.");
+    eprintln!("После импорта удали файл везде: shred -u {out} (и на устройстве).");
+    Ok(())
+}
+
+fn cli_export_passvault(path: &PathBuf, out: &str) -> Result<(), String> {
+    let pass = ask("Пароль хранилища: ")?;
+    let v = vault::load(path, &pass)?;
+    let n = export::passvault_to_file(&v, std::path::Path::new(out))?;
+    eprintln!("{n} паролей -> {out} (ОТКРЫТЫЙ ТЕКСТ). PassVault: Настройки → Импорт → PassVault JSON, пароль файла пустой.");
+    eprintln!("После импорта удали файл везде: shred -u {out} (и на устройстве).");
+    Ok(())
+}

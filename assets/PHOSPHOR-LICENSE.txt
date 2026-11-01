@@ -1,0 +1,3 @@
+assets/phosphor-subset.ttf — подмножество шрифта Phosphor Icons (@phosphor-icons/web 2.1.2, regular),
+https://phosphoricons.com — лицензия MIT, Copyright (c) 2020 Phosphor Icons.
+Пересборка подмножества: pyftsubset Phosphor.ttf --unicodes=<список из src/gui.rs, mod icon> --no-hinting --layout-features=''
