@@ -44,6 +44,8 @@ pub mod icon {
     pub const IMAGE: &str = "\u{e2ca}";
     pub const GLOBE: &str = "\u{e288}";
     pub const RESET: &str = "\u{e038}";
+    pub const MINUS: &str = "\u{e32a}";
+    pub const RECENT: &str = "\u{e1a0}";
 }
 use icon::*;
 
@@ -71,12 +73,22 @@ const YEL: Color32 = Color32::from_rgb(235, 203, 139);
 const GRN: Color32 = Color32::from_rgb(163, 190, 140);
 
 pub fn run(path: PathBuf) -> eframe::Result<()> {
+    // Wayland: иконку панель берёт из .desktop по app_id — держим их актуальными (пишет только при изменении)
+    let _ = crate::desktop::ensure_installed();
+    let mut vp = egui::ViewportBuilder::default()
+        .with_title("2FA Codes and Passwords")
+        .with_app_id(crate::desktop::APP_ID);
+    if let Some(rgba) = crate::desktop::icon_rgba(128) {
+        vp = vp.with_icon(std::sync::Arc::new(egui::IconData { rgba, width: 128, height: 128 }));
+    }
+    #[cfg(feature = "devshot")]
+    if let Some(w) = std::env::var("PASS2FA_DEV_W").ok().and_then(|w| w.parse::<f32>().ok()) {
+        vp = vp.with_min_inner_size([300.0, 300.0]).with_inner_size([w, 720.0]);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("2FA Codes and Passwords")
-            .with_app_id("pass2fa")
+        viewport: vp
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([760.0, 420.0]),
+            .with_min_inner_size([520.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native("pass2fa", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path)))))
@@ -257,6 +269,22 @@ struct App {
     frames: u32,
 }
 
+/// Число с кнопками «−» / «+» (значение можно и тянуть мышью, и ввести).
+fn stepper(ui: &mut egui::Ui, v: &mut i64, min: i64, max: i64, step: i64, suffix: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let b = Vec2::new(28.0, 26.0);
+        if ui.add_enabled(*v > min, egui::Button::new(MINUS).min_size(b)).clicked() {
+            // к ближайшему кратному шагу вниз (30 → 15, 29 → 15)
+            *v = (((*v - 1).div_euclid(step)) * step).max(min);
+        }
+        ui.add(egui::DragValue::new(v).range(min..=max).suffix(suffix).speed(0.2));
+        if ui.add_enabled(*v < max, egui::Button::new(PLUS).min_size(b)).clicked() {
+            *v = (((*v).div_euclid(step) + 1) * step).min(max);
+        }
+    });
+}
+
 /// Поле секрета с кнопкой «глаз». Возвращает ответ TextEdit.
 fn secret_field(ui: &mut egui::Ui, text: &mut String, show: &mut bool, hint: &str, width: f32) -> egui::Response {
     ui.horizontal(|ui| {
@@ -325,6 +353,10 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, path: PathBuf) -> Self {
         nord(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(1.25);
+        #[cfg(feature = "devshot")]
+        if let Some(z) = std::env::var("PASS2FA_DEV_ZOOM").ok().and_then(|z| z.parse::<f32>().ok()) {
+            cc.egui_ctx.set_zoom_factor(z);
+        }
         let screen = if vault::exists(&path) {
             Screen::Locked { pass: String::new(), err: None, show: false }
         } else {
@@ -464,6 +496,7 @@ impl App {
                 Ok("settings") => s.tab = Tab::Settings,
                 Ok("edit") if s.edit.is_none() => s.edit = Some(Edit::Login { idx: Some(0), e: s.v.passwords[0].clone(), show: false }),
                 Ok("picker") if s.picker.is_none() => s.picker = Some(Picker::open(Purpose::Import, &["csv", "json", "txt"], None)),
+                Ok("editcode") if s.edit.is_none() => s.edit = Some(Edit::Code { idx: Some(0), e: s.v.codes[0].clone(), uri: String::new(), err: None, show: false }),
                 _ => {}
             }
         }
@@ -612,24 +645,36 @@ impl App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.tab, Tab::Codes, format!("{SHIELD} 2FA ({})", s.v.codes.len()));
-                ui.selectable_value(&mut s.tab, Tab::Logins, format!("{KEY} Пароли ({})", s.v.passwords.len()));
-                ui.selectable_value(&mut s.tab, Tab::Settings, format!("{GEAR} Импорт и настройки"));
+                // узкое окно: вкладки и кнопки — только значки (подписи во всплывающих подсказках)
+                let compact = ui.available_width() < 720.0;
+                let (nc, np) = (s.v.codes.len(), s.v.passwords.len());
+                let t1 = if compact { format!("{SHIELD} {nc}") } else { format!("{SHIELD} 2FA ({nc})") };
+                let t2 = if compact { format!("{KEY} {np}") } else { format!("{KEY} Пароли ({np})") };
+                let t3 = if compact { GEAR.to_string() } else { format!("{GEAR} Импорт и настройки") };
+                ui.selectable_value(&mut s.tab, Tab::Codes, t1).on_hover_text("2FA");
+                ui.selectable_value(&mut s.tab, Tab::Logins, t2).on_hover_text("Пароли");
+                ui.selectable_value(&mut s.tab, Tab::Settings, t3).on_hover_text("Импорт и настройки");
                 ui.separator();
-                let r = ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text(format!("{SEARCH} поиск (Ctrl+F)")).desired_width(240.0));
+                let right_w = if compact { 84.0 } else { 196.0 };
+                let clear_w = if s.filter.is_empty() { 0.0 } else { 28.0 };
+                let w = (ui.available_width() - right_w - clear_w - 12.0).clamp(60.0, 260.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut s.filter).hint_text(format!("{SEARCH} поиск (Ctrl+F)")).desired_width(w));
                 if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) { r.request_focus(); }
                 if !s.filter.is_empty() && ui.small_button(X).on_hover_text("очистить (Esc)").clicked() { s.filter.clear(); }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) && s.edit.is_none() && s.picker.is_none() { s.filter.clear(); }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(format!("{LOCK} Блок")).on_hover_text("Ctrl+L").clicked() { want_lock = true; }
+                    let lock = if compact { LOCK.to_string() } else { format!("{LOCK} Блок") };
+                    if ui.button(lock).on_hover_text("Заблокировать (Ctrl+L)").clicked() { want_lock = true; }
                     match s.tab {
                         Tab::Codes => {
-                            if ui.button(format!("{PLUS} 2FA")).clicked() {
+                            let t = if compact { PLUS.to_string() } else { format!("{PLUS} 2FA") };
+                            if ui.button(t).on_hover_text("Добавить 2FA").clicked() {
                                 s.edit = Some(Edit::Code { idx: None, e: TotpEntry::new("", ""), uri: String::new(), err: None, show: true });
                             }
                         }
                         Tab::Logins => {
-                            if ui.button(format!("{PLUS} Пароль")).clicked() {
+                            let t = if compact { PLUS.to_string() } else { format!("{PLUS} Пароль") };
+                            if ui.button(t).on_hover_text("Добавить пароль").clicked() {
                                 s.edit = Some(Edit::Login { idx: None, e: LoginEntry::default(), show: true });
                             }
                         }
@@ -659,9 +704,11 @@ impl App {
                                         let c = &s.v.codes[i];
                                         ic.paint(ui, c.icon_path.as_deref(), &code_cands(c), &c.name, ICON);
                                         ui.add_space(6.0);
-                                        // справа фиксированно: код 130 + шкала 56 + 3 кнопки
-                                        let right = 130.0 + 56.0 + 3.0 * 34.0 + 30.0;
-                                        let name_w = (ui.available_width() - right).max(80.0);
+                                        // справа фиксированно: код + шкала + 3 кнопки; в узком окне шкалы нет, код уже
+                                        let narrow = ui.available_width() < 520.0;
+                                        let code_w = if narrow { 116.0 } else { 130.0 };
+                                        let right = code_w + if narrow { 0.0 } else { 56.0 } + 3.0 * 34.0 + 24.0;
+                                        let name_w = (ui.available_width() - right).max(60.0);
                                         ui.allocate_ui_with_layout(Vec2::new(name_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
                                             ui.set_min_width(name_w);
                                             ui.set_max_width(name_w);
@@ -671,15 +718,17 @@ impl App {
                                             Some((code, left)) => {
                                                 let col = if left <= 5 { RED } else if left <= 10 { YEL } else { N8 };
                                                 let r = ui
-                                                    .allocate_ui_with_layout(Vec2::new(130.0, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
-                                            ui.set_min_width(130.0);
-                                            ui.set_max_width(130.0);
+                                                    .allocate_ui_with_layout(Vec2::new(code_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
+                                            ui.set_min_width(code_w);
+                                            ui.set_max_width(code_w);
                                                         ui.add(egui::Label::new(RichText::new(group(&code)).monospace().size(22.0).color(col)).sense(egui::Sense::click()))
                                                     })
                                                     .inner
                                                     .on_hover_text("клик — копировать");
-                                                ui.add(egui::ProgressBar::new(left as f32 / c.period.max(1) as f32).desired_width(48.0).desired_height(5.0).fill(col));
-                                                ui.add_space(8.0);
+                                                if !narrow {
+                                                    ui.add(egui::ProgressBar::new(left as f32 / c.period.max(1) as f32).desired_width(48.0).desired_height(5.0).fill(col));
+                                                    ui.add_space(8.0);
+                                                }
                                                 if r.clicked() || ui.button(COPY).on_hover_text("копировать код").clicked() {
                                                     to_copy = Some((code, "Код"));
                                                 }
@@ -714,9 +763,12 @@ impl App {
                                         let l = &s.v.passwords[i];
                                         ic.paint(ui, l.icon.as_deref(), &login_cands(l), &l.name, ICON);
                                         ui.add_space(6.0);
-                                        // справа: логин 230+кн, пароль 150+2кн, 2 кн
-                                        let right = 230.0 + 34.0 + 150.0 + 2.0 * 34.0 + 2.0 * 34.0 + 50.0;
-                                        let name_w = (ui.available_width() - right).max(100.0);
+                                        // справа: логин+кн, пароль+2кн, 2 кн; колонки логина/пароля сжимаются в узком окне,
+                                        // в совсем узком — остаются только кнопки (текст логина/пароля скрыт)
+                                        let aw = ui.available_width();
+                                        let (user_w, pass_w) = if aw > 900.0 { (230.0, 150.0) } else if aw > 680.0 { (150.0, 100.0) } else { (0.0, 0.0) };
+                                        let right = user_w + 34.0 + pass_w + if pass_w > 0.0 { 2.0 } else { 1.0 } * 34.0 + 2.0 * 34.0 + 40.0;
+                                        let name_w = (aw - right).max(80.0);
                                         let sub = icons::host(&l.url).unwrap_or_else(|| l.url.clone());
                                         let sub = (!sub.is_empty() && sub != l.name.trim_start_matches("www.")).then_some(sub);
                                         let lay = if sub.is_some() {
@@ -734,22 +786,26 @@ impl App {
                                             }
                                             if !l.note.is_empty() { r.on_hover_text(&l.note); }
                                         });
-                                        ui.allocate_ui_with_layout(Vec2::new(230.0, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
-                                            ui.set_min_width(230.0);
-                                            ui.set_max_width(230.0);
-                                            ui.add(egui::Label::new(RichText::new(&l.username).color(N4)).truncate());
-                                        });
-                                        if ui.add_enabled(!l.username.is_empty(), egui::Button::new(format!("{USER}"))).on_hover_text("копировать логин").clicked() {
+                                        if user_w > 0.0 {
+                                            ui.allocate_ui_with_layout(Vec2::new(user_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
+                                                ui.set_min_width(user_w);
+                                                ui.set_max_width(user_w);
+                                                ui.add(egui::Label::new(RichText::new(&l.username).color(N4)).truncate());
+                                            });
+                                        }
+                                        if ui.add_enabled(!l.username.is_empty(), egui::Button::new(format!("{USER}"))).on_hover_text(format!("копировать логин: {}", l.username)).clicked() {
                                             to_copy = Some((l.username.clone(), "Логин"));
                                         }
                                         let vis = s.shown.contains(&i);
-                                        ui.allocate_ui_with_layout(Vec2::new(150.0, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
-                                            ui.set_min_width(150.0);
-                                            ui.set_max_width(150.0);
-                                            let t = if vis { l.password.clone() } else { "••••••••••".into() };
-                                            ui.add(egui::Label::new(RichText::new(t).monospace()).truncate());
-                                        });
-                                        if ui.button(if vis { EYE_OFF } else { EYE }).on_hover_text(if vis { "скрыть" } else { "показать" }).clicked() {
+                                        if pass_w > 0.0 {
+                                            ui.allocate_ui_with_layout(Vec2::new(pass_w, ROW_H - 8.0), Layout::left_to_right(Align::Center), |ui| {
+                                                ui.set_min_width(pass_w);
+                                                ui.set_max_width(pass_w);
+                                                let t = if vis { l.password.clone() } else { "••••••••••".into() };
+                                                ui.add(egui::Label::new(RichText::new(t).monospace()).truncate());
+                                            });
+                                        }
+                                        if pass_w > 0.0 && ui.button(if vis { EYE_OFF } else { EYE }).on_hover_text(if vis { "скрыть" } else { "показать" }).clicked() {
                                             if vis { s.shown.remove(&i); } else { s.shown.insert(i); }
                                         }
                                         if ui.button(KEY).on_hover_text("копировать пароль").clicked() {
@@ -882,8 +938,16 @@ impl App {
                             ui.label("Имя"); ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(380.0)); ui.end_row();
                             ui.label("Issuer"); ui.add(egui::TextEdit::singleline(&mut e.issuer).desired_width(380.0)); ui.end_row();
                             ui.label("Секрет (base32)"); secret_field(ui, &mut e.secret, show, "", 340.0); ui.end_row();
-                            ui.label("Цифр"); ui.add(egui::DragValue::new(&mut e.digits).range(6..=9)); ui.end_row();
-                            ui.label("Период, с"); ui.add(egui::DragValue::new(&mut e.period).range(10..=120)); ui.end_row();
+                            ui.label("Цифр");
+                            let mut d = e.digits as i64;
+                            stepper(ui, &mut d, 6, 9, 1, "");
+                            e.digits = d as u32;
+                            ui.end_row();
+                            ui.label("Период, с");
+                            let mut p = e.period as i64;
+                            stepper(ui, &mut p, 10, 120, 15, " с");
+                            e.period = p as u64;
+                            ui.end_row();
                             ui.label("Алгоритм");
                             egui::ComboBox::from_id_salt("algo").selected_text(format!("{:?}", e.algorithm)).show_ui(ui, |ui| {
                                 for a in [Algo::SHA1, Algo::SHA256, Algo::SHA512] {
@@ -916,7 +980,9 @@ impl App {
                             ui.label("Пароль"); secret_field(ui, &mut e.password, show, "", 340.0); ui.end_row();
                             ui.label("");
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut s.gen.len).range(8..=128).suffix(" симв."));
+                                let mut n = s.gen.len as i64;
+                                stepper(ui, &mut n, 8, 128, 1, " симв.");
+                                s.gen.len = n as usize;
                                 ui.checkbox(&mut s.gen.upper, "A-Z");
                                 ui.checkbox(&mut s.gen.digits, "0-9");
                                 ui.checkbox(&mut s.gen.symbols, "!#$");

@@ -1,3 +1,4 @@
+mod desktop;
 mod export;
 mod filepick;
 mod gen;
@@ -18,6 +19,8 @@ const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-ш�
   pass2fa code <подстрока имени>   напечатать текущий TOTP-код (для скриптов: | wl-copy)
   pass2fa export-aegis <файл>      2FA в открытый JSON для импорта в Aegis (после переноса удалить!)
   pass2fa export-passvault <файл>  пароли в открытый JSON для PassVault (после переноса удалить!)
+  pass2fa install-desktop          .desktop + иконка в ~/.local/share (GUI делает это сам при старте)
+  pass2fa uninstall-desktop        убрать их
 
   --vault <путь>   файл хранилища (иначе $PASS2FA_VAULT или ~/.local/share/2FApass/vault.age)
   Восстановление без программы:  age -d vault.age";
@@ -36,6 +39,14 @@ fn main() {
         Some("code") if args.len() == 2 => cli_code(&path, &args[1]),
         Some("export-aegis") if args.len() == 2 => cli_export_aegis(&path, &args[1]),
         Some("export-passvault") if args.len() == 2 => cli_export_passvault(&path, &args[1]),
+        Some("install-desktop") => desktop::ensure_installed().map(|w| {
+            if w.is_empty() { eprintln!("уже установлено"); }
+            for p in w { eprintln!("записано: {}", p.display()); }
+        }),
+        Some("uninstall-desktop") => {
+            for p in desktop::uninstall() { eprintln!("удалено: {}", p.display()); }
+            Ok(())
+        }
         Some("-h" | "--help" | "help") => { println!("{USAGE}"); Ok(()) }
         _ => Err(USAGE.to_string()),
     };
