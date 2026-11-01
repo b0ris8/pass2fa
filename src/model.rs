@@ -32,6 +32,9 @@ pub struct TotpEntry {
     /// своя иконка: путь к файлу (абсолютный или от папки хранилища) или "si:<slug>"; None — автоподбор
     #[serde(default)]
     pub icon_path: Option<String>,
+    /// сайты, где вводится этот код (для расширения браузера); пусто — сопоставление по issuer
+    #[serde(default)]
+    pub sites: Vec<String>,
 }
 
 impl TotpEntry {
@@ -44,6 +47,7 @@ impl TotpEntry {
             period: 30,
             algorithm: Algo::SHA1,
             icon_path: None,
+            sites: Vec::new(),
         }
     }
 }
@@ -65,6 +69,9 @@ pub struct LoginEntry {
     /// группа (папка); пусто — «Без группы»
     #[serde(default)]
     pub group: String,
+    /// дополнительные сайты этой учётной записи (кроме url)
+    #[serde(default)]
+    pub extra_sites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -79,11 +86,29 @@ pub struct Vault {
     /// явный список групп — чтобы пустая группа не пропадала
     #[serde(default)]
     pub groups: Vec<String>,
+    /// группы равнозначных доменов (один сервис на нескольких доменах): proton.me = protonmail.com …
+    #[serde(default = "default_equiv")]
+    pub equiv: Vec<Vec<String>>,
+}
+
+/// Частые случаи «один сервис — несколько доменов». Правятся в настройках.
+pub fn default_equiv() -> Vec<Vec<String>> {
+    [
+        "proton.me protonmail.com protonmail.ch proton.ch pm.me",
+        "anthropic.com claude.ai claude.com",
+        "openai.com chatgpt.com",
+        "google.com gmail.com youtube.com",
+        "microsoft.com live.com outlook.com office.com microsoftonline.com",
+        "apple.com icloud.com",
+    ]
+    .iter()
+    .map(|l| l.split_whitespace().map(String::from).collect())
+    .collect()
 }
 
 impl Default for Vault {
     fn default() -> Self {
-        Self { version: FORMAT_VERSION, codes: vec![], passwords: vec![], groups: vec![] }
+        Self { version: FORMAT_VERSION, codes: vec![], passwords: vec![], groups: vec![], equiv: default_equiv() }
     }
 }
 
@@ -116,7 +141,10 @@ impl Vault {
         for c in other.codes.iter() {
             let key = norm_secret(&c.secret);
             if let Some(e) = self.codes.iter_mut().find(|e| norm_secret(&e.secret) == key) {
-                if e != c { *e = c.clone(); st.codes_updated += 1; }
+                // чего нет в источнике (сайты) — не затираем
+                let mut n = c.clone();
+                if n.sites.is_empty() { n.sites = e.sites.clone(); }
+                if *e != n { *e = n; st.codes_updated += 1; }
             } else {
                 self.codes.push(c.clone());
                 st.codes_added += 1;
@@ -126,7 +154,9 @@ impl Vault {
             if let Some(e) = self.passwords.iter_mut().find(|e| {
                 e.name == l.name && e.url == l.url && e.username == l.username
             }) {
-                if e != l { *e = l.clone(); st.logins_updated += 1; }
+                let mut n = l.clone();
+                if n.extra_sites.is_empty() { n.extra_sites = e.extra_sites.clone(); }
+                if *e != n { *e = n; st.logins_updated += 1; }
             } else {
                 self.passwords.push(l.clone());
                 st.logins_added += 1;
@@ -176,7 +206,7 @@ impl Vault {
 mod tests {
     use super::*;
     fn login(name: &str, group: &str) -> LoginEntry {
-        LoginEntry { name: name.into(), url: String::new(), username: String::new(), password: "p".into(), note: String::new(), icon: None, group: group.into() }
+        LoginEntry { name: name.into(), url: String::new(), username: String::new(), password: "p".into(), note: String::new(), icon: None, group: group.into(), extra_sites: Vec::new() }
     }
     #[test]
     fn groups_ops() {

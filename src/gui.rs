@@ -235,8 +235,24 @@ enum Screen {
 enum Tab { Codes, Logins, Settings }
 
 enum Edit {
-    Code { idx: Option<usize>, e: TotpEntry, uri: String, err: Option<String>, show: bool },
-    Login { idx: Option<usize>, e: LoginEntry, show: bool },
+    Code { idx: Option<usize>, e: TotpEntry, uri: String, err: Option<String>, show: bool, sites: String },
+    Login { idx: Option<usize>, e: LoginEntry, show: bool, sites: String },
+}
+
+impl Edit {
+    fn code(idx: Option<usize>, e: TotpEntry, show: bool) -> Self {
+        let sites = e.sites.join("\n");
+        Edit::Code { idx, e, uri: String::new(), err: None, show, sites }
+    }
+    fn login(idx: Option<usize>, e: LoginEntry, show: bool) -> Self {
+        let sites = e.extra_sites.join("\n");
+        Edit::Login { idx, e, show, sites }
+    }
+}
+
+/// Группы равнозначных доменов → текст для редактора (строка = группа).
+fn equiv_text(v: &Vault) -> String {
+    v.equiv.iter().map(|g| g.join(" ")).collect::<Vec<_>>().join("\n")
 }
 
 struct Session {
@@ -269,6 +285,8 @@ struct Session {
     confirm_group_del: Option<String>,
     gen_last: String,
     gen_show: bool,
+    /// редактор групп равнозначных доменов (настройки)
+    equiv_buf: String,
 }
 
 struct App {
@@ -691,7 +709,7 @@ impl App {
             match std::env::var("PASS2FA_DEV_TAB").as_deref() {
                 Ok("logins") => s.tab = Tab::Logins,
                 Ok("settings") => s.tab = Tab::Settings,
-                Ok("edit" | "editnarrow") if s.edit.is_none() => s.edit = Some(Edit::Login { idx: Some(0), e: s.v.passwords[0].clone(), show: false }),
+                Ok("edit" | "editnarrow") if s.edit.is_none() => s.edit = Some(Edit::login(Some(0), s.v.passwords[0].clone(), false)),
                 Ok("picker") if s.picker.is_none() => s.picker = Some(Picker::open(Purpose::Import, &["csv", "json", "txt"], None)),
                 Ok("gen") if self.frames == 8 => {
                     s.tab = Tab::Logins;
@@ -701,7 +719,7 @@ impl App {
                     s.tab = Tab::Logins;
                     s.new_group = Some(String::new());
                 }
-                Ok("editcode") if s.edit.is_none() => s.edit = Some(Edit::Code { idx: Some(0), e: s.v.codes[0].clone(), uri: String::new(), err: None, show: false }),
+                Ok("editcode") if s.edit.is_none() => s.edit = Some(Edit::code(Some(0), s.v.codes[0].clone(), false)),
                 _ => {}
             }
         }
@@ -745,6 +763,7 @@ impl Session {
             confirm_group_del: None,
             gen_last: String::new(),
             gen_show: false,
+            equiv_buf: String::new(),
         }
     }
     fn matches(&self, hay: &[&str]) -> bool {
@@ -905,7 +924,7 @@ impl App {
                         Tab::Codes => {
                             let t = if compact { PLUS.to_string() } else { format!("{PLUS} 2FA") };
                             if ui.button(t).on_hover_text("Добавить 2FA").clicked() {
-                                s.edit = Some(Edit::Code { idx: None, e: TotpEntry::new("", ""), uri: String::new(), err: None, show: true });
+                                s.edit = Some(Edit::code(None, TotpEntry::new("", ""), true));
                             }
                         }
                         Tab::Logins => {
@@ -913,7 +932,7 @@ impl App {
                             if ui.button(t).on_hover_text("Добавить пароль").clicked() {
                                 let mut e = LoginEntry::default();
                                 e.group = s.group_filter.clone().unwrap_or_default();
-                                s.edit = Some(Edit::Login { idx: None, e, show: true });
+                                s.edit = Some(Edit::login(None, e, true));
                             }
                         }
                         Tab::Settings => {}
@@ -943,7 +962,7 @@ impl App {
                 Tab::Codes => {
                     let now = totp::now();
                     let rows: Vec<usize> = (0..s.v.codes.len())
-                        .filter(|&i| { let c = &s.v.codes[i]; s.matches(&[&c.name, &c.issuer]) })
+                        .filter(|&i| { let c = &s.v.codes[i]; s.matches(&[&c.name, &c.issuer, &c.sites.join(" ")]) })
                         .collect();
                     if s.v.codes.is_empty() { ui.label(format!("Пусто. «{PLUS} 2FA» или вкладка импорта.")); }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
@@ -991,7 +1010,7 @@ impl App {
                                             }
                                         }
                                         if ui.button(EDIT).on_hover_text("изменить").clicked() {
-                                            s.edit = Some(Edit::Code { idx: Some(i), e: s.v.codes[i].clone(), uri: String::new(), err: None, show: false });
+                                            s.edit = Some(Edit::code(Some(i), s.v.codes[i].clone(), false));
                                         }
                                         del_button(ui, &mut s.confirm_del, &mut del_now, Tab::Codes, i);
                                     });
@@ -1033,7 +1052,7 @@ impl App {
                                     let mut e = LoginEntry::default();
                                     e.password = s.gen_last.clone();
                                     e.group = s.group_filter.clone().unwrap_or_default();
-                                    s.edit = Some(Edit::Login { idx: None, e, show: true });
+                                    s.edit = Some(Edit::login(None, e, true));
                                 }
                             }
                         });
@@ -1057,7 +1076,7 @@ impl App {
                         .filter(|&i| {
                             let l = &s.v.passwords[i];
                             s.group_filter.as_ref().is_none_or(|g| &l.group == g)
-                                && s.matches(&[&l.name, &l.url, &l.username, &l.note, &l.group])
+                                && s.matches(&[&l.name, &l.url, &l.username, &l.note, &l.group, &l.extra_sites.join(" ")])
                         })
                         .collect();
                     if rows.is_empty() {
@@ -1112,7 +1131,7 @@ impl App {
                                         h.dnd_set_drag_payload(DragLogin(i));
                                         if h.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::Grab); }
                                         if h.double_clicked() {
-                                            s.edit = Some(Edit::Login { idx: Some(i), e: s.v.passwords[i].clone(), show: false });
+                                            s.edit = Some(Edit::login(Some(i), s.v.passwords[i].clone(), false));
                                         }
                                         let cur_group = l.group.clone();
                                         h.context_menu(|ui| {
@@ -1161,7 +1180,7 @@ impl App {
                                         }
                                         ui.add_space(8.0);
                                         if ui.button(EDIT).on_hover_text("изменить").clicked() {
-                                            s.edit = Some(Edit::Login { idx: Some(i), e: s.v.passwords[i].clone(), show: false });
+                                            s.edit = Some(Edit::login(Some(i), s.v.passwords[i].clone(), false));
                                         }
                                         del_button(ui, &mut s.confirm_del, &mut del_now, Tab::Logins, i);
                                     });
@@ -1256,6 +1275,25 @@ impl App {
                         }
                         ui.add_space(16.0);
                         ui.separator();
+                        ui.heading(format!("{GLOBE} Равнозначные домены"));
+                        ui.label("Один сервис на разных доменах. Строка — группа, домены через пробел. Пароль с адресом proton.me подставится и на protonmail.com; 2FA с Issuer «Proton» — на обоих.");
+                        if s.equiv_buf.is_empty() { s.equiv_buf = equiv_text(&s.v); }
+                        ui.add(egui::TextEdit::multiline(&mut s.equiv_buf).desired_rows(4).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                        ui.horizontal(|ui| {
+                            if ui.button(format!("{CHECK} Применить")).clicked() {
+                                s.v.equiv = crate::native::parse_equiv(&s.equiv_buf);
+                                s.equiv_buf = equiv_text(&s.v);
+                                dirty = true;
+                                message = Some((format!("групп доменов: {}", s.v.equiv.len()), GRN));
+                            }
+                            if ui.button("По умолчанию").clicked() {
+                                s.v.equiv = crate::model::default_equiv();
+                                s.equiv_buf = equiv_text(&s.v);
+                                dirty = true;
+                            }
+                        });
+                        ui.add_space(16.0);
+                        ui.separator();
                         ui.heading("Файлы");
                         ui.label(format!("Хранилище: {}", vault_path.display()));
                         ui.label("Рядом: vault.age.bak — предыдущая версия (после каждого сохранения).");
@@ -1329,7 +1367,7 @@ impl App {
                 ui.set_width(mw);
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 110.0).max(120.0)).show(ui, |ui| {
                 match ed {
-                    Edit::Code { idx, e, uri, err, show } => {
+                    Edit::Code { idx, e, uri, err, show, sites } => {
                         ui.heading(if idx.is_some() { "Изменить 2FA" } else { "Новый 2FA" });
                         ui.label("otpauth:// (из QR) — заполнит поля ниже:");
                         if ui.add(egui::TextEdit::singleline(uri).desired_width(mw)).changed() {
@@ -1343,6 +1381,9 @@ impl App {
                         ui.add_space(4.0);
                         form_row(ui, narrow, "Имя", |ui| { ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(fw)); });
                         form_row(ui, narrow, "Issuer", |ui| { ui.add(egui::TextEdit::singleline(&mut e.issuer).desired_width(fw)); });
+                        form_row(ui, narrow, "Сайты", |ui| {
+                            ui.add(egui::TextEdit::multiline(sites).desired_rows(2).hint_text("по одному на строку: https://account.proton.me\nпусто — по Issuer").desired_width(fw));
+                        });
                         form_row(ui, narrow, "Секрет (base32)", |ui| { secret_field(ui, &mut e.secret, show, "", fw - 44.0); });
                         form_row(ui, narrow, "Цифр", |ui| {
                             let mut d = e.digits as i64;
@@ -1366,11 +1407,14 @@ impl App {
                         });
                         if let Some(er) = err { ui.colored_label(RED, er.as_str()); }
                     }
-                    Edit::Login { idx, e, show } => {
+                    Edit::Login { idx, e, show, sites } => {
                         ui.heading(if idx.is_some() { "Изменить пароль" } else { "Новый пароль" });
                         ui.add_space(4.0);
                         form_row(ui, narrow, "Имя", |ui| { ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(fw)); });
                         form_row(ui, narrow, "URL", |ui| { ui.add(egui::TextEdit::singleline(&mut e.url).desired_width(fw)); });
+                        form_row(ui, narrow, "Доп. сайты", |ui| {
+                            ui.add(egui::TextEdit::multiline(sites).desired_rows(1).hint_text("ещё адреса, по одному на строку").desired_width(fw));
+                        });
                         form_row(ui, narrow, "Логин", |ui| { ui.add(egui::TextEdit::singleline(&mut e.username).desired_width(fw)); });
                         form_row(ui, narrow, "Пароль", |ui| { secret_field(ui, &mut e.password, show, "", fw - 44.0); });
                         form_row(ui, narrow, "", |ui| {
@@ -1418,13 +1462,15 @@ impl App {
             });
             if save_btn {
                 match ed {
-                    Edit::Code { e, err, .. } => {
+                    Edit::Code { e, err, sites, .. } => {
+                        e.sites = crate::native::parse_sites(sites);
                         e.secret = e.secret.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
                         if e.name.trim().is_empty() { *err = Some("нужно имя".into()); }
                         else if totp::base32_decode(&e.secret).is_none() { *err = Some("секрет не base32".into()); }
                         else { commit = true; }
                     }
-                    Edit::Login { e, .. } => {
+                    Edit::Login { e, sites, .. } => {
+                        e.extra_sites = crate::native::parse_sites(sites);
                         if !e.name.trim().is_empty() { commit = true; }
                     }
                 }

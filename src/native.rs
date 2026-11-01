@@ -119,11 +119,11 @@ pub fn endpoint(url: &str) -> Option<Endpoint> {
 }
 
 fn found(v: &Vault, tab: &Endpoint) -> Value {
-    // (точное совпадение хоста+порта — первым, затем поддомены)
+    // (точное совпадение хоста+порта — первым, затем поддомены, затем равнозначные домены)
     let mut hits: Vec<(u8, &LoginEntry)> = v
         .passwords
         .iter()
-        .filter_map(|l| entry_endpoint(l).and_then(|e| endpoint_rank(&e, tab)).map(|r| (r, l)))
+        .filter_map(|l| login_rank(l, tab, &v.equiv).map(|r| (r, l)))
         .collect();
     hits.sort_by_key(|(r, l)| (*r, l.name.to_lowercase()));
     let logins: Vec<Value> = hits
@@ -135,7 +135,7 @@ fn found(v: &Vault, tab: &Endpoint) -> Value {
     let codes: Vec<Value> = v
         .codes
         .iter()
-        .filter(|c| code_matches(c, host))
+        .filter(|c| code_matches(c, tab, &v.equiv))
         .filter_map(|c| {
             let (code, left) = totp::code_at(c, now)?;
             // следующий код — чтобы расширение не вставило истекающий (left ≤ 3 с)
@@ -150,44 +150,110 @@ fn found(v: &Vault, tab: &Endpoint) -> Value {
     json!({ "ok": true, "host": shown, "logins": logins, "totp": codes })
 }
 
-/// Адрес записи: из URL, иначе из имени, если оно похоже на домен (CSV часто кладёт домен в name).
-fn entry_endpoint(l: &LoginEntry) -> Option<Endpoint> {
-    endpoint(&l.url).or_else(|| {
-        let n = l.name.trim();
-        (n.contains('.') && !n.contains(' ') && !n.contains('@')).then(|| endpoint(n)).flatten()
-    })
+/// Адреса записи: URL + доп. сайты; если URL пуст — имя, когда оно похоже на домен (CSV часто кладёт домен в name).
+fn entry_endpoints(l: &LoginEntry) -> Vec<Endpoint> {
+    let mut out: Vec<Endpoint> = endpoint(&l.url)
+        .or_else(|| {
+            let n = l.name.trim();
+            (l.url.trim().is_empty() && n.contains('.') && !n.contains(' ') && !n.contains('@')).then(|| endpoint(n)).flatten()
+        })
+        .into_iter()
+        .collect();
+    out.extend(l.extra_sites.iter().filter_map(|s| endpoint(s)));
+    out
 }
 
-/// 0 — тот же хост и порт, 1 — поддомен сохранённого; None — не подходит.
+fn login_rank(l: &LoginEntry, tab: &Endpoint, equiv: &[Vec<String>]) -> Option<u8> {
+    entry_endpoints(l).iter().filter_map(|e| endpoint_rank(e, tab, equiv)).min()
+}
+
+/// Группа равнозначных доменов, к которой относится хост (сам домен группы или его поддомен).
+fn equiv_group<'a>(equiv: &'a [Vec<String>], host: &str) -> Option<&'a Vec<String>> {
+    equiv.iter().find(|g| g.iter().any(|d| host_matches(d, host)))
+}
+
+/// 0 — тот же хост и порт, 1 — поддомен сохранённого, 2 — равнозначный домен; None — не подходит.
 /// Порт обязан совпасть, если он известен у обоих (dev1step.com:6493 ≠ dev1step.com).
-fn endpoint_rank(saved: &Endpoint, tab: &Endpoint) -> Option<u8> {
+/// Равнозначность — только когда сохранён сам домен группы (proton.me), а не чей-то поддомен
+/// (tenant.example.net не «наследует» всю группу).
+fn endpoint_rank(saved: &Endpoint, tab: &Endpoint, equiv: &[Vec<String>]) -> Option<u8> {
     if let (Some(a), Some(b)) = (saved.port, tab.port) {
         if a != b {
             return None;
         }
     }
-    if !host_matches(&saved.host, &tab.host) {
-        return None;
+    if host_matches(&saved.host, &tab.host) {
+        return Some(if saved.host == tab.host { 0 } else { 1 });
     }
-    Some(if saved.host == tab.host { 0 } else { 1 })
+    let g = equiv.iter().find(|g| g.iter().any(|d| d.trim_start_matches("www.") == saved.host))?;
+    g.iter().any(|d| host_matches(d, &tab.host)).then_some(2)
 }
 
 /// Точное совпадение или вкладка — поддомен сохранённого хоста (по границе метки).
 /// id.atlassian.com ≠ atlassian.com.evil.io; accounts.google.com ⊂ google.com.
 pub fn host_matches(saved: &str, tab: &str) -> bool {
-    let (s, t) = (saved.trim_start_matches("www."), tab.trim_start_matches("www."));
+    let (s, t) = (saved.trim().trim_start_matches("www."), tab.trim_start_matches("www."));
     !s.is_empty() && (s == t || t.ends_with(&format!(".{s}")))
 }
 
-/// TOTP без URL: совпадение по метке домена второго уровня (github.com → «github») в issuer/имени.
-fn code_matches(c: &TotpEntry, host: &str) -> bool {
+/// Метка сервиса в домене: github.com → «github», account.proton.me → «proton».
+fn service_label(host: &str) -> Option<&str> {
     let labels: Vec<&str> = host.split('.').collect();
-    let Some(label) = labels.len().checked_sub(2).map(|i| labels[i]) else { return false };
-    if label.len() < 3 {
+    let l = labels.len().checked_sub(2).map(|i| labels[i])?;
+    (l.len() >= 3).then_some(l)
+}
+
+/// TOTP: если у записи заданы сайты — строго по хосту и порту (как логины, с равнозначными доменами).
+/// Иначе — только по issuer (название сервиса) против метки домена вкладки и равнозначных ему доменов:
+/// issuer «Proton» подходит к proton.me и protonmail.com, «Anthropic» — к claude.ai.
+/// Имя аккаунта/почта НЕ участвуют — иначе код «…@protonmail.com» всплывал бы на любом сайте с этой почтой.
+fn code_matches(c: &TotpEntry, tab: &Endpoint, equiv: &[Vec<String>]) -> bool {
+    let sites: Vec<Endpoint> = c.sites.iter().filter_map(|s| endpoint(s)).collect();
+    if !sites.is_empty() {
+        return sites.iter().any(|s| endpoint_rank(s, tab, equiv).is_some());
+    }
+    // issuer; если пуст — имя без «(аккаунт)» и без слов с @
+    let service = if c.issuer.trim().is_empty() {
+        let head = c.name.split('(').next().unwrap_or("");
+        head.split_whitespace().filter(|w| !w.contains('@')).collect::<Vec<_>>().join(" ")
+    } else {
+        c.issuer.clone()
+    };
+    let hay = icons::norm(&service);
+    if hay.is_empty() {
         return false;
     }
-    let hay = icons::norm(&format!("{} {}", c.issuer, c.name));
-    hay.contains(&icons::norm(label))
+    let mut labels: Vec<&str> = service_label(&tab.host).into_iter().collect();
+    if let Some(g) = equiv_group(equiv, &tab.host) {
+        labels.extend(g.iter().filter_map(|d| service_label(d.trim_start_matches("www."))));
+    }
+    labels.iter().any(|l| hay.contains(&icons::norm(l)))
+}
+
+/// Разбор поля «по одному на строку» (также через пробел/запятую) → список адресов.
+pub fn parse_sites(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Разбор групп равнозначных доменов: строка = группа, домены через пробел/запятую; группы из одного домена отбрасываются.
+pub fn parse_equiv(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .map(|l| {
+            l.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .filter_map(|d| endpoint(d).map(|e| e.host))
+                .fold(Vec::<String>::new(), |mut acc, h| {
+                    if !acc.contains(&h) {
+                        acc.push(h);
+                    }
+                    acc
+                })
+        })
+        .filter(|g| g.len() >= 2)
+        .collect()
 }
 
 // ---------- установка манифестов хоста ----------
@@ -285,7 +351,7 @@ mod tests {
     #[test]
     fn find_for_host() {
         let mut v = Vault::default();
-        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: "u".into(), password: "p".into(), note: String::new(), icon: None, group: String::new() };
+        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: "u".into(), password: "p".into(), note: String::new(), icon: None, group: String::new(), extra_sites: Vec::new() };
         v.passwords.push(mk("GitHub", "https://github.com/login"));
         v.passwords.push(mk("accounts.google.com", ""));
         v.passwords.push(mk("Evil", "https://github.com.evil.io"));
@@ -306,8 +372,76 @@ mod tests {
     }
 
     #[test]
+    fn totp_not_by_account_email() {
+        let mut v = Vault::default();
+        // Proton-аккаунт с почтой на protonmail.com; GitHub-аккаунт с той же почтой
+        let mut p = TotpEntry::new("b0ris8@protonmail.com", "JBSWY3DPEHPK3PXP");
+        p.issuer = "Proton".into();
+        let mut g = TotpEntry::new("GitHub (b0ris8@protonmail.com)", "GEZDGNBVGY3TQOJQ");
+        g.issuer = "GitHub".into();
+        let mut l = TotpEntry::new("LinkedIn (b.vasilica@1step.md)", "JBSWY3DPEHPK3PXQ");
+        l.issuer = "LinkedIn".into();
+        // явный сайт с портом
+        let mut gr = TotpEntry::new("Grafana", "JBSWY3DPEHPK3PXR");
+        gr.sites = vec!["https://dev1step.com:6493".into()];
+        v.codes.extend([p, g, l, gr]);
+        let codes = |u: &str| -> Vec<String> {
+            found(&v, &endpoint(u).unwrap())["totp"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(codes("https://github.com/login"), vec!["GitHub (b0ris8@protonmail.com)"]);
+        assert_eq!(codes("https://account.proton.me/login"), vec!["b0ris8@protonmail.com"]);
+        assert_eq!(codes("https://mail.protonmail.com/"), vec!["b0ris8@protonmail.com"]); // proton.me ≡ protonmail.com
+        assert!(codes("https://1step.md/").is_empty());          // почта аккаунта не притягивает код
+        assert_eq!(codes("https://dev1step.com:6493/login"), vec!["Grafana"]);
+        assert!(codes("https://dev1step.com/").is_empty());
+    }
+
+    #[test]
+    fn equivalent_domains() {
+        let mut v = Vault::default();
+        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: name.into(), password: "p".into(), note: String::new(), icon: None, group: String::new(), extra_sites: Vec::new() };
+        v.passwords.push(mk("Proton", "https://account.proton.me"));
+        v.passwords.push(mk("Proton root", "https://proton.me"));
+        let mut oa = mk("OpenAI", "https://platform.openai.com");
+        oa.extra_sites = vec!["chatgpt.com".into()];
+        v.passwords.push(oa);
+        let mut a = TotpEntry::new("b0ris8@protonmail.com", "JBSWY3DPEHPK3PXP");
+        a.issuer = "Anthropic".into();
+        let mut o = TotpEntry::new("OpenAI (me)", "GEZDGNBVGY3TQOJQ");
+        o.sites = vec!["https://auth.openai.com".into(), "chatgpt.com".into()];
+        v.codes.extend([a, o]);
+        let names = |v: &Vault, u: &str, k: &str| -> Vec<String> {
+            found(v, &endpoint(u).unwrap())[k].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap().to_string()).collect()
+        };
+        // сохранён корень группы → работает на равнозначных; поддомен (account.proton.me) — только сам
+        assert_eq!(names(&v, "https://mail.protonmail.com/", "logins"), vec!["Proton root"]);
+        assert_eq!(names(&v, "https://account.proton.me/", "logins"), vec!["Proton", "Proton root"]);
+        assert_eq!(names(&v, "https://chatgpt.com/auth", "logins"), vec!["OpenAI"]);
+        assert_eq!(names(&v, "https://openai.com/", "logins"), vec!["OpenAI"]); // доп. сайт chatgpt.com — корень группы
+        assert_eq!(names(&v, "https://claude.ai/login", "totp"), vec!["b0ris8@protonmail.com"]);
+        assert_eq!(names(&v, "https://console.anthropic.com/", "totp"), vec!["b0ris8@protonmail.com"]);
+        assert_eq!(names(&v, "https://chatgpt.com/", "totp"), vec!["OpenAI (me)"]);
+        assert_eq!(names(&v, "https://openai.com/", "totp"), vec!["OpenAI (me)"]); // сайт chatgpt.com ≡ openai.com
+        assert!(names(&v, "https://github.com/", "totp").is_empty());
+        assert!(names(&v, "https://proton.me/", "totp").is_empty());
+        // без групп — равнозначности нет
+        v.equiv.clear();
+        assert!(names(&v, "https://claude.ai/login", "totp").is_empty());
+        assert!(names(&v, "https://mail.protonmail.com/", "logins").is_empty());
+    }
+
+    #[test]
+    fn parse_lists() {
+        assert_eq!(parse_sites("a.com\n https://b.com:8443/x , c.io"), vec!["a.com", "https://b.com:8443/x", "c.io"]);
+        assert_eq!(
+            parse_equiv("proton.me, https://www.protonmail.com/\nsolo.com\n\nopenai.com chatgpt.com chatgpt.com"),
+            vec![vec!["proton.me".to_string(), "protonmail.com".into()], vec!["openai.com".into(), "chatgpt.com".into()]]
+        );
+    }
+
+    #[test]
     fn ports() {
-        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: name.into(), password: "p".into(), note: String::new(), icon: None, group: String::new() };
+        let mk = |name: &str, url: &str| LoginEntry { name: name.into(), url: url.into(), username: name.into(), password: "p".into(), note: String::new(), icon: None, group: String::new(), extra_sites: Vec::new() };
         let mut v = Vault::default();
         v.passwords.push(mk("grafana", "https://dev1step.com:6493/login"));
         v.passwords.push(mk("apache", "https://dev1step.com/"));

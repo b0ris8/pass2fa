@@ -116,6 +116,7 @@ fn foreign_json(val: &serde_json::Value) -> Result<Vault, String> {
                 icon: None,
                 // PassVault ставит «General» по умолчанию — это не группа
                 group: Some(g("category")).filter(|c| !c.is_empty() && c != "General").unwrap_or_default(),
+                extra_sites: Vec::new(),
             });
         }
     }
@@ -169,7 +170,10 @@ fn from_csv(text: &str) -> Result<Vault, String> {
             continue;
         }
         let mut name = get(c_name);
-        let url = get(c_url);
+        // в поле URL бывает несколько адресов (Proton Pass) — первый в URL, остальные в доп. сайты
+        let mut urls = crate::native::parse_sites(&get(c_url));
+        let url = if urls.is_empty() { String::new() } else { urls.remove(0) };
+        let all_urls: Vec<String> = std::iter::once(url.clone()).filter(|u| !u.is_empty()).chain(urls.iter().cloned()).collect();
         let mut username = get(c_user);
         if username.is_empty() {
             username = get(c_email);
@@ -181,7 +185,7 @@ fn from_csv(text: &str) -> Result<Vault, String> {
         let note = get(c_note);
         let otp = get(c_totp);
         if !password.is_empty() || !username.is_empty() {
-            v.passwords.push(LoginEntry { name: name.clone(), url, username: username.clone(), password, note, icon: None, group: get(c_group) });
+            v.passwords.push(LoginEntry { name: name.clone(), url, username: username.clone(), password, note, icon: None, group: get(c_group), extra_sites: urls });
         }
         if !otp.is_empty() {
             let e = if otp.starts_with("otpauth://") {
@@ -192,6 +196,8 @@ fn from_csv(text: &str) -> Result<Vault, String> {
             match e {
                 Some(mut e) => {
                     if e.name.is_empty() { e.name = name.clone(); }
+                    // код из записи с адресом — привязан к её сайтам, а не к issuer/почте
+                    e.sites = all_urls.clone();
                     v.codes.push(e)
                 }
                 None => return Err(format!("CSV строка {}: не разобрал TOTP для «{}»", n + 2, name)),
@@ -236,8 +242,8 @@ mod tests {
     #[test]
     fn passvault_roundtrip() {
         let mut v = Vault::default();
-        v.passwords.push(LoginEntry { name: "GitHub".into(), url: "https://github.com".into(), username: "b0ris8".into(), password: "p@ss".into(), note: "n".into(), icon: None, group: "Работа".into() });
-        v.passwords.push(LoginEntry { name: "Заметка".into(), url: String::new(), username: String::new(), password: String::new(), note: "текст".into(), icon: None, group: String::new() });
+        v.passwords.push(LoginEntry { name: "GitHub".into(), url: "https://github.com".into(), username: "b0ris8".into(), password: "p@ss".into(), note: "n".into(), icon: None, group: "Работа".into(), extra_sites: Vec::new() });
+        v.passwords.push(LoginEntry { name: "Заметка".into(), url: String::new(), username: String::new(), password: String::new(), note: "текст".into(), icon: None, group: String::new(), extra_sites: Vec::new() });
         let j = crate::export::passvault_json(&v);
         // ровно поля ImportRecord, nullable — явно
         let keys: Vec<_> = j[0].as_object().unwrap().keys().cloned().collect();
