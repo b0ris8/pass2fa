@@ -14,12 +14,12 @@ pub const FIREFOX_EXT_ID: &str = "pass2fa@b0ris8";
 pub const CHROMIUM_EXT_ID: &str = "mppimlmnkoibdoennahbdmclgegncjed";
 const MAX_IN: usize = 64 * 1024; // от браузера приходят маленькие запросы
 
-/// Нас запустил браузер? Firefox: argv[1] — путь к манифесту, argv[2] — id расширения;
-/// Chromium: argv[1] — "chrome-extension://<id>/".
+/// Нас запустил браузер? Firefox/LibreWolf: argv[1] — путь к манифесту, argv[2] — id расширения
+/// (на Windows путь произвольный — проверяем id); Chromium: argv[1] — "chrome-extension://<id>/".
 pub fn invoked_by_browser(args: &[String]) -> bool {
-    args.first().is_some_and(|a| {
-        a.starts_with("chrome-extension://") || (a.ends_with(".json") && a.contains("ative") && a.contains(HOST_NAME))
-    })
+    args.first().is_some_and(|a| a.starts_with("chrome-extension://"))
+        || args.get(1).is_some_and(|a| a == FIREFOX_EXT_ID)
+        || args.first().is_some_and(|a| a.ends_with(".json") && a.contains("ative") && a.contains(HOST_NAME))
 }
 
 fn read_msg(r: &mut impl Read) -> Option<Value> {
@@ -257,6 +257,24 @@ pub fn parse_equiv(text: &str) -> Vec<Vec<String>> {
 }
 
 // ---------- установка манифестов хоста ----------
+// Манифест указывает на текущий бинарник (current_exe): `pass2fa install` сначала копирует себя
+// в постоянное место и запускает install-browser уже оттуда.
+
+/// Хост + расширение (pass2fa-firefox.xpi и chromium/ — из встроенных в бинарник файлов).
+pub fn install() -> Result<Vec<PathBuf>, String> {
+    let mut out = install_host()?;
+    let (xpi, ch) = crate::bundle::write(&crate::bundle::dir())?;
+    out.push(xpi);
+    out.push(ch);
+    Ok(out)
+}
+
+pub fn uninstall() -> Vec<PathBuf> {
+    let mut v = uninstall_host();
+    v.extend(crate::bundle::remove(&crate::bundle::dir()));
+    v
+}
+
 #[cfg(unix)]
 fn manifest_dirs() -> Vec<(PathBuf, bool)> {
     // (папка, это Firefox-семейство?)
@@ -290,21 +308,32 @@ fn manifest(exe: &str, firefox: bool) -> Value {
     m
 }
 
+fn write_manifest(p: &Path, exe: &str, firefox: bool) -> Result<(), String> {
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    // UTF-8 без BOM — путь может быть с кириллицей (C:\Users\Администратор\…)
+    std::fs::write(p, serde_json::to_string_pretty(&manifest(exe, firefox)).unwrap()).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+fn current_exe() -> Result<String, String> {
+    std::env::current_exe().map(|p| p.display().to_string()).map_err(|e| e.to_string())
+}
+
 #[cfg(unix)]
-pub fn install() -> Result<Vec<PathBuf>, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+fn install_host() -> Result<Vec<PathBuf>, String> {
+    let exe = current_exe()?;
     let mut out = Vec::new();
     for (dir, ff) in manifest_dirs() {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let p = dir.join(format!("{HOST_NAME}.json"));
-        std::fs::write(&p, serde_json::to_string_pretty(&manifest(&exe, ff)).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
+        write_manifest(&p, &exe, ff)?;
         out.push(p);
     }
     Ok(out)
 }
 
 #[cfg(unix)]
-pub fn uninstall() -> Vec<PathBuf> {
+fn uninstall_host() -> Vec<PathBuf> {
     manifest_dirs()
         .into_iter()
         .map(|(d, _)| d.join(format!("{HOST_NAME}.json")))
@@ -312,12 +341,61 @@ pub fn uninstall() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(not(unix))]
-pub fn install() -> Result<Vec<PathBuf>, String> {
-    Err("на Windows пока не реализовано (нужен ключ реестра HKCU\\Software\\Mozilla\\NativeMessagingHosts)".into())
+// Windows: браузеры ищут манифест не по папке, а по ключу реестра HKCU\…\NativeMessagingHosts\pass2fa
+// (значение по умолчанию = путь к манифесту). Firefox-семейство: ключ Mozilla (LibreWolf — его же,
+// ключ LibreWolf — на всякий случай); Chromium-семейство читает ключ Chrome/Chromium.
+#[cfg(windows)]
+const REG_KEYS: [(&str, bool); 4] = [
+    (r"HKCU\Software\Mozilla\NativeMessagingHosts\pass2fa", true),
+    (r"HKCU\Software\LibreWolf\NativeMessagingHosts\pass2fa", true),
+    (r"HKCU\Software\Google\Chrome\NativeMessagingHosts\pass2fa", false),
+    (r"HKCU\Software\Chromium\NativeMessagingHosts\pass2fa", false),
+];
+
+#[cfg(windows)]
+fn win_manifests() -> Result<(PathBuf, PathBuf), String> {
+    let d = dirs::data_local_dir().ok_or("нет %LOCALAPPDATA%")?.join("pass2fa").join("NativeMessagingHosts");
+    Ok((d.join(format!("{HOST_NAME}.json")), d.join(format!("{HOST_NAME}.chromium.json"))))
 }
-#[cfg(not(unix))]
-pub fn uninstall() -> Vec<PathBuf> {
+
+#[cfg(windows)]
+fn reg(args: &[&str]) -> Result<(), String> {
+    let o = std::process::Command::new("reg").args(args).output().map_err(|e| format!("reg: {e}"))?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(format!("reg {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim()))
+    }
+}
+
+#[cfg(windows)]
+fn install_host() -> Result<Vec<PathBuf>, String> {
+    let exe = current_exe()?;
+    let (ff, ch) = win_manifests()?;
+    write_manifest(&ff, &exe, true)?;
+    write_manifest(&ch, &exe, false)?;
+    for (key, firefox) in REG_KEYS {
+        let m = if firefox { &ff } else { &ch };
+        reg(&["add", key, "/ve", "/t", "REG_SZ", "/d", &m.display().to_string(), "/f"])?;
+    }
+    Ok(vec![ff, ch])
+}
+
+#[cfg(windows)]
+fn uninstall_host() -> Vec<PathBuf> {
+    for (key, _) in REG_KEYS {
+        let _ = reg(&["delete", key, "/f"]);
+    }
+    let Ok((ff, ch)) = win_manifests() else { return vec![] };
+    [ff, ch].into_iter().filter(|p| std::fs::remove_file(p).is_ok()).collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_host() -> Result<Vec<PathBuf>, String> {
+    Err("эта ОС не поддерживается".into())
+}
+#[cfg(not(any(unix, windows)))]
+fn uninstall_host() -> Vec<PathBuf> {
     vec![]
 }
 
@@ -461,6 +539,8 @@ mod tests {
     fn detect_invocation() {
         assert!(invoked_by_browser(&["/home/u/.mozilla/native-messaging-hosts/pass2fa.json".into(), "pass2fa@b0ris8".into()]));
         assert!(invoked_by_browser(&["chrome-extension://abc/".into()]));
+        // Windows: манифест в произвольной папке — узнаём по id расширения
+        assert!(invoked_by_browser(&[r"C:\Users\Администратор\AppData\Local\pass2fa\pass2fa.json".into(), FIREFOX_EXT_ID.into()]));
         assert!(!invoked_by_browser(&["import".into(), "x.json".into()]));
     }
 }

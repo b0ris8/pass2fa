@@ -1,3 +1,4 @@
+mod bundle;
 mod desktop;
 mod export;
 mod filepick;
@@ -22,8 +23,11 @@ const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-ш�
   pass2fa code <подстрока имени>   напечатать текущий TOTP-код (для скриптов: | wl-copy)
   pass2fa export-aegis <файл>      2FA в открытый JSON для импорта в Aegis (после переноса удалить!)
   pass2fa export-passvault <файл>  пароли в открытый JSON для PassVault (после переноса удалить!)
-  pass2fa install-browser          манифест native messaging для Firefox/LibreWolf/Chromium (браузерное расширение)
-  pass2fa uninstall-browser        убрать его
+  pass2fa install                  установить: программа в постоянное место (Linux ~/.local/bin,
+                                   Windows %LOCALAPPDATA%\\pass2fa), хост для браузеров, файлы расширения, ярлык
+  pass2fa uninstall                убрать всё это (хранилище не трогается)
+  pass2fa install-browser          только хост native messaging + файлы расширения (для этого бинарника)
+  pass2fa uninstall-browser        убрать их
   pass2fa lock                     заблокировать общую сессию (GUI/браузер), стереть ключи из keyring
   pass2fa install-desktop          .desktop + иконка в ~/.local/share (GUI делает это сам при старте)
   pass2fa uninstall-desktop        убрать их
@@ -51,9 +55,17 @@ fn main() {
         Some("code") if args.len() == 2 => cli_code(&path, &args[1]),
         Some("export-aegis") if args.len() == 2 => cli_export_aegis(&path, &args[1]),
         Some("export-passvault") if args.len() == 2 => cli_export_passvault(&path, &args[1]),
+        Some("install") => cli_install(),
+        Some("uninstall") => {
+            for p in native::uninstall().into_iter().chain(desktop::uninstall()) { eprintln!("удалено: {}", p.display()); }
+            if let Ok(exe) = installed_exe() {
+                eprintln!("программу удали сам: {}", exe.display());
+            }
+            Ok(())
+        }
         Some("install-browser") => native::install().map(|w| {
             for p in w { eprintln!("записано: {}", p.display()); }
-            eprintln!("Firefox/LibreWolf: id расширения {}; Chromium: {}", native::FIREFOX_EXT_ID, native::CHROMIUM_EXT_ID);
+            extension_hint();
         }),
         Some("uninstall-browser") => {
             for p in native::uninstall() { eprintln!("удалено: {}", p.display()); }
@@ -84,7 +96,82 @@ fn die(e: &str) -> ! {
 }
 
 fn ask(prompt: &str) -> Result<SecretString, String> {
-    rpassword::prompt_password(prompt).map(SecretString::from).map_err(|e| e.to_string())
+    // подсказку печатаем сами: rpassword на Windows пишет её в CONOUT$ байтами — кириллица ломается
+    eprint!("{prompt}");
+    rpassword::read_password().map(SecretString::from).map_err(|e| e.to_string())
+}
+
+/// Постоянное место программы: оттуда её запускают браузер и ярлык, сборку можно удалять/пересобирать.
+fn installed_exe() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        Ok(dirs::data_local_dir().ok_or("нет %LOCALAPPDATA%")?.join("pass2fa").join("pass2fa.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(dirs::home_dir().ok_or("нет $HOME")?.join(".local").join("bin").join("pass2fa"))
+    }
+}
+
+/// Скопировать бинарник на место, не мешая запущенной копии: рядом .new → переименование поверх.
+/// Windows не даёт перезаписать запущенный exe, но даёт его переименовать — старый уходит в .old.
+fn place_exe(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    if let Some(d) = dst.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let new = dst.with_extension("new");
+    std::fs::copy(src, &new).map_err(|e| format!("{}: {e}", new.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+    if std::fs::rename(&new, dst).is_err() {
+        let old = dst.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(dst, &old).map_err(|e| format!("{}: {e} (закрой окно pass2fa и повтори)", dst.display()))?;
+        std::fs::rename(&new, dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    }
+    Ok(())
+}
+
+fn cli_install() -> Result<(), String> {
+    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dst = installed_exe()?;
+    if std::fs::canonicalize(&cur).ok() != std::fs::canonicalize(&dst).ok() {
+        place_exe(&cur, &dst)?;
+    }
+    eprintln!("программа: {}", dst.display());
+    // дальше — от имени установленной копии: манифест браузера и ярлык указывают на неё
+    let mut steps = vec!["install-browser"];
+    if cfg!(unix) {
+        steps.push("install-desktop");
+    }
+    for s in steps {
+        let st = std::process::Command::new(&dst).arg(s).status().map_err(|e| format!("{} {s}: {e}", dst.display()))?;
+        if !st.success() {
+            return Err(format!("{} {s}: ошибка (см. выше)", dst.display()));
+        }
+    }
+    #[cfg(windows)]
+    eprintln!("\nЧтобы звать просто `pass2fa` из терминала, добавь папку в PATH пользователя (один раз):\n  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';{}', 'User')",
+        dst.parent().map(|p| p.display().to_string()).unwrap_or_default());
+    Ok(())
+}
+
+fn extension_hint() {
+    let d = bundle::dir();
+    eprintln!(
+        "\nРасширение (ставится один раз; при обновлении программы — переустановить тем же способом):\n\
+         \u{20} LibreWolf/Firefox ESR: about:config → xpinstall.signatures.required = false;\n\
+         \u{20}   about:addons → ⚙ → «Установить дополнение из файла…» → {}\n\
+         \u{20} Chromium/Chrome/Brave: chrome://extensions → «Режим разработчика» → «Загрузить распакованное» → {}\n\
+         \u{20} id: Firefox {}, Chromium {}",
+        d.join("pass2fa-firefox.xpi").display(),
+        d.join("chromium").display(),
+        native::FIREFOX_EXT_ID,
+        native::CHROMIUM_EXT_ID
+    );
 }
 
 /// Открыть хранилище: из общей сессии (если разблокировано) или по паролю; нет файла — создать.

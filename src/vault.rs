@@ -108,7 +108,18 @@ fn wrap_key(vault: &Path, id: &Identity, pass: &SecretString) -> Result<(), Stri
 /// Быстро: данные по уже развёрнутому ключу.
 pub fn load_with(path: &Path, id: &Identity) -> Result<Vault, String> {
     let raw = fs::read(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
-    parse_vault(&decrypt(&raw, id)?)
+    let dec = age::Decryptor::new(&raw[..]).map_err(|e| format!("не age-файл: {e}"))?;
+    let mut r = dec.decrypt(std::iter::once(id as &dyn age::Identity)).map_err(|e| match e {
+        // пароль тут не участвует: ключ уже развёрнут, значит vault.age зашифрован другим ключом
+        age::DecryptError::NoMatchingKeys => format!(
+            "{} не от этого ключа: vault.age и vault.key.age из разных копий (скопируй оба файла вместе)",
+            path.display()
+        ),
+        other => decrypt_err(other),
+    })?;
+    let mut out = zeroize::Zeroizing::new(Vec::new());
+    r.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    parse_vault(&out)
 }
 
 /// Вход по паролю: новый формат — развернуть ключ; старый — прочитать и мигрировать.

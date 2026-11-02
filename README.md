@@ -1,6 +1,6 @@
 # pass2fa — локальные пароли и 2FA
 
-egui/eframe (wgpu, только Wayland), без GTK/порталов/DBus. Хранилище — два файла стандартного age
+egui/eframe (wgpu), без GTK/порталов/DBus. Linux (Wayland) и Windows 10/11; браузерное расширение для LibreWolf/Firefox и Chromium. Хранилище — два файла стандартного age
 (схема «ключ, обёрнутый паролем», как в KeePass):
 
 - `vault.key.age` — случайный ключ хранилища (X25519), зашифрованный мастер-паролем (scrypt 2^20 — медленно
@@ -11,9 +11,70 @@ egui/eframe (wgpu, только Wayland), без GTK/порталов/DBus. Хр
 только ключ (прежний — в `vault.key.age.before-passwd-*`). Старый формат (один файл по паролю) при первом
 входе мигрирует сам, исходник — в `vault.age.legacy`.
 
-## Сборка
+## Установка — Linux (Artix и др.)
+
+Нужен Rust (`pacman -S rustup && rustup default stable`).
+
+    git clone https://github.com/b0ris8/pass2fa.git ~/WorkDev/repositories/GitHub/pass2fa
+    cd ~/WorkDev/repositories/GitHub/pass2fa
     cargo build --release
-    install -Dm755 target/release/pass2fa ~/.local/bin/pass2fa
+    ./target/release/pass2fa install
+
+`install` делает всё сразу:
+- копирует программу в `~/.local/bin/pass2fa` (папка должна быть в `PATH`);
+- регистрирует хост для браузеров (`~/.mozilla`, `~/.librewolf`, Chromium-семейство — где есть профиль);
+- раскладывает расширение в `~/.local/share/pass2fa/extension/` (`pass2fa-firefox.xpi` и папку `chromium/`);
+- создаёт ярлык и иконку в меню (`~/.local/share/applications`).
+
+## Установка — Windows 10/11
+
+Нужен Rust с MSVC (один раз, PowerShell от администратора):
+
+    choco install -y visualstudio2022-workload-vctools rustup.install
+    rustup default stable-x86_64-pc-windows-msvc
+
+Сборка и установка (обычный PowerShell, без администратора):
+
+    git clone https://github.com/b0ris8/pass2fa.git C:\WorkDev\pass2fa
+    cd C:\WorkDev\pass2fa
+    cargo build --release
+    .\target\release\pass2fa.exe install
+
+`install` копирует программу в `%LOCALAPPDATA%\pass2fa\pass2fa.exe`, пишет манифесты хоста в
+`%LOCALAPPDATA%\pass2fa\NativeMessagingHosts\` и ключи `HKCU\Software\{Mozilla,LibreWolf,Google\Chrome,Chromium}\NativeMessagingHosts\pass2fa`,
+раскладывает расширение в `%LOCALAPPDATA%\pass2fa\extension\`. Администратор не нужен, всё в профиле пользователя.
+В конце печатает команду, чтобы добавить папку программы в `PATH`.
+
+Сборка на сетевом/облачном диске (`P:\…`): собирай с `--target-dir C:\build\pass2fa`, чтобы `target` не синхронизировался.
+
+## Расширение браузера (один раз на браузер)
+
+- **LibreWolf / Firefox ESR / Developer Edition**: `about:config` → `xpinstall.signatures.required = false`;
+  `about:addons` → ⚙ → «Установить дополнение из файла…» → `pass2fa-firefox.xpi` из папки расширения (см. выше).
+- **Chromium / Chrome / Brave**: `chrome://extensions` → «Режим разработчика» → «Загрузить распакованное» → папка `chromium`.
+- Обычный Firefox неподписанное расширение насовсем не ставит: только `about:debugging` (до перезапуска).
+
+Расширение встроено в бинарник — версия всегда совпадает с программой. Профиль браузера, перенесённый
+с другой машины, уже содержит расширение: достаточно `pass2fa install` (нужен только хост).
+
+## Обновление
+
+    git pull
+    cargo build --release          # Windows: … --target-dir C:\build\pass2fa
+    ./target/release/pass2fa install
+
+Программа заменяется на месте, даже если окно pass2fa открыто (Windows: старая копия уходит в `pass2fa.old`).
+Если изменилось расширение (`extension/`), переустанови его в браузере из того же файла.
+Удаление — `pass2fa uninstall`: хранилище не трогается.
+
+## Хранилище и перенос между машинами
+
+- Linux: `~/.local/share/2FApass/` · Windows: `%LOCALAPPDATA%\2FApass\`; другой путь — `--vault <путь>` или `PASS2FA_VAULT`.
+- Файлов два, **переносить и бэкапить только парой**: `vault.age` и `vault.key.age`.
+- Копии на разных машинах независимы: правка на одной не попадёт на другую. Держи одну основную,
+  на остальные копируй оба файла заново (например, `scp "host:.local/share/2FApass/vault*.age" "$env:LOCALAPPDATA\2FApass\"`).
+- «vault.age не от этого ключа» — файлы из разных копий; «неверный пароль» — неверный пароль
+  (в окне и браузере проверь раскладку: кнопка «глаз» показывает введённое).
 
 ## Использование
     pass2fa                       # GUI
@@ -23,8 +84,7 @@ egui/eframe (wgpu, только Wayland), без GTK/порталов/DBus. Хр
     pass2fa export-aegis a.json   # 2FA в открытый JSON для Aegis (разовый перенос, потом shred -u)
     pass2fa export-passvault p.json # пароли в открытый JSON для PassVault (Android); импорт его JSON — обычным import
 
-Хранилище: `~/.local/share/2FApass/vault.age` (Windows: `%LOCALAPPDATA%\2FApass\vault.age`),
-другой путь — `--vault <путь>` или `PASS2FA_VAULT`. После каждого сохранения предыдущая версия — `vault.age.bak`.
+После каждого сохранения предыдущая версия хранилища — `vault.age.bak`.
 
 Восстановление без программы: `age -d -i vault.key.age vault.age > vault.json` (age спросит пароль).
 
@@ -56,23 +116,21 @@ Proton Pass `vault`, KeePass `Group`, PassVault `category`; экспорт в Pa
 
 ## Браузер (native messaging, без демона)
 Браузер сам запускает `pass2fa` на каждый запрос и закрывает его. Разблокировка общая для окна,
-расширения и CLI: в kernel keyring пользователя лежит только ключ хранилища (не мастер-пароль),
-30 мин без обращений, на диск не пишется. «Блок»/Ctrl+L в окне и `pass2fa lock` закрывают всё.
+расширения и CLI, хранится только ключ хранилища (не мастер-пароль), 30 мин без обращений:
+- Linux — kernel keyring пользователя, на диск не пишется;
+- Windows — ключ, зашифрованный DPAPI (учётная запись Windows), в `%LOCALAPPDATA%\pass2fa\session.bin`;
+  прочитать может только этот пользователь на этой машине, по истечении срока или при блокировке файл стирается.
+
+«Блок»/Ctrl+L в окне и `pass2fa lock` закрывают всё.
 Заполнение только по действию (клик / Alt+Shift+L — логин, Alt+Shift+O — TOTP, Alt+Shift+P — окно),
 только https (http — лишь для localhost), хост и порт сравниваются строго (`dev1step.com:6493` ≠ `dev1step.com`),
 поля ищутся и в shadow DOM, и во фреймах того же сайта; чужие фреймы не заполняются.
 
-    install -Dm755 target/release/pass2fa ~/.local/bin/pass2fa
-    ~/.local/bin/pass2fa install-browser      # манифест хоста указывает на этот бинарник
-    ./tools/build-extension.sh                # extension/dist/{firefox,chromium}, pass2fa-firefox.xpi
+Только хост и файлы расширения, без копирования программы: `pass2fa install-browser` (манифест укажет на этот бинарник).
+Сборка расширения в `extension/dist/` для разработки: `./tools/build-extension.sh`.
 
-- Chromium/Brave/Vivaldi: `chrome://extensions` → режим разработчика → «Загрузить распакованное» → `extension/dist/chromium`
-  (id фиксирован ключом в манифесте: `mppimlmnkoibdoennahbdmclgegncjed`).
-- LibreWolf / Firefox ESR / Developer Edition: `about:config` → `xpinstall.signatures.required = false`,
-  затем `about:addons` → «Установить из файла» → `extension/dist/pass2fa-firefox.xpi`.
-- Обычный Firefox неподписанное расширение насовсем не ставит: либо `about:debugging` (до перезапуска),
-  либо подпись «unlisted» через AMO (нужен аккаунт Mozilla).
-- Windows: хост пока не реализован (нужен ключ реестра HKCU и DPAPI вместо keyring).
+Если расширение пишет «pass2fa не отвечает … No such native application» — не выполнен `pass2fa install`
+(или браузер не перезапущен после него).
 
 ### Какие записи показываются на сайте
 - **Пароль** — по `URL` и «Доп. сайты» (по одному на строку). Пустой URL — берётся имя, если оно похоже на домен.

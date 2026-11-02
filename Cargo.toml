@@ -1,6 +1,6 @@
 [package]
 name = "otp_local_gui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -30,6 +30,9 @@ miniz_oxide = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [profile.release]
 opt-level = 3
