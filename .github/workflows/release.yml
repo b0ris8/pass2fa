@@ -1,0 +1,66 @@
+# Релиз: git tag v0.3.0 && git push origin v0.3.0 → сборка Linux и Windows → GitHub Release с архивами.
+# Ручной запуск (Actions → release → Run workflow) — только сборка, архивы в артефактах запуска.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04 # старый glibc → бинарник идёт и на свежих дистрибутивах
+            target: linux-x86_64
+          - os: windows-2022
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Зависимости сборки (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
+
+      - name: Тесты (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --release --locked
+
+      - name: Сборка
+        run: cargo build --release --locked
+
+      - name: Архив (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="pass2fa-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/pass2fa README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Архив (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "pass2fa-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/pass2fa.exe, target/release/pass2faw.exe, packaging/install.cmd, README.md $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: pass2fa-*
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pass2fa-*
