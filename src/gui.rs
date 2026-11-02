@@ -455,12 +455,23 @@ fn site_url(url: &str, name: &str) -> Option<String> {
     Some(if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") })
 }
 
-/// Открыть адрес в браузере по умолчанию: $BROWSER, затем xdg-open, затем librewolf/firefox. Только http(s).
+/// Открыть адрес в браузере по умолчанию: Windows — ShellExecute; Linux — $BROWSER, xdg-open, librewolf/firefox. Только http(s).
 fn open_in_browser(url: &str) -> Result<(), String> {
     let low = url.to_lowercase();
     if !(low.starts_with("https://") || low.starts_with("http://")) {
         return Err(format!("не http(s): {url}"));
     }
+    // Windows: браузер по умолчанию через ShellExecuteW (xdg-open/librewolf в PATH там нет)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (op, file) = (w("open"), w(url));
+        let h = unsafe { ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+        return if h as usize > 32 { Ok(()) } else { Err(format!("ShellExecute: код {}", h as usize)) };
+    }
+    #[allow(unreachable_code)]
     let mut cands: Vec<String> = std::env::var("BROWSER").map(|b| b.split(':').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default();
     cands.extend(["xdg-open", "librewolf", "firefox"].map(String::from));
     for c in cands {

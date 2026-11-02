@@ -1,17 +1,4 @@
-mod bundle;
-mod desktop;
-mod export;
-mod filepick;
-mod gen;
-mod icons;
-mod gui;
-mod import;
-mod model;
-mod native;
-mod session;
-mod state;
-mod totp;
-mod vault;
+use otp_local_gui::{bundle, desktop, export, gui, import, model, native, session, totp, vault};
 
 use age::secrecy::SecretString;
 use std::path::PathBuf;
@@ -29,7 +16,7 @@ const USAGE: &str = "pass2fa — локальные пароли и 2FA (age-ш�
   pass2fa install-browser          только хост native messaging + файлы расширения (для этого бинарника)
   pass2fa uninstall-browser        убрать их
   pass2fa lock                     заблокировать общую сессию (GUI/браузер), стереть ключи из keyring
-  pass2fa install-desktop          .desktop + иконка в ~/.local/share (GUI делает это сам при старте)
+  pass2fa install-desktop          ярлык в меню: Linux .desktop + иконка, Windows «Пуск» (GUI делает это сам)
   pass2fa uninstall-desktop        убрать их
 
   --vault <путь>   файл хранилища (иначе $PASS2FA_VAULT или ~/.local/share/2FApass/vault.age)
@@ -59,7 +46,7 @@ fn main() {
         Some("uninstall") => {
             for p in native::uninstall().into_iter().chain(desktop::uninstall()) { eprintln!("удалено: {}", p.display()); }
             if let Ok(exe) = installed_exe() {
-                eprintln!("программу удали сам: {}", exe.display());
+                eprintln!("программу удали сам: {}", exe.parent().filter(|_| cfg!(windows)).unwrap_or(&exe).display());
             }
             Ok(())
         }
@@ -140,14 +127,20 @@ fn cli_install() -> Result<(), String> {
     let dst = installed_exe()?;
     if std::fs::canonicalize(&cur).ok() != std::fs::canonicalize(&dst).ok() {
         place_exe(&cur, &dst)?;
+        // Windows: рядом GUI без консоли (pass2faw.exe) — на него ведёт ярлык в «Пуске»
+        #[cfg(windows)]
+        {
+            let w = cur.with_file_name("pass2faw.exe");
+            if w.is_file() {
+                place_exe(&w, &dst.with_file_name("pass2faw.exe"))?;
+            } else {
+                eprintln!("нет {} — ярлык откроет консольную версию (собери: cargo build --release)", w.display());
+            }
+        }
     }
     eprintln!("программа: {}", dst.display());
     // дальше — от имени установленной копии: манифест браузера и ярлык указывают на неё
-    let mut steps = vec!["install-browser"];
-    if cfg!(unix) {
-        steps.push("install-desktop");
-    }
-    for s in steps {
+    for s in ["install-browser", "install-desktop"] {
         let st = std::process::Command::new(&dst).arg(s).status().map_err(|e| format!("{} {s}: {e}", dst.display()))?;
         if !st.success() {
             return Err(format!("{} {s}: ошибка (см. выше)", dst.display()));

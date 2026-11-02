@@ -1,8 +1,9 @@
 //! Иконка приложения. На Wayland окно не может само выставить иконку (winit 0.30 это игнорирует),
 //! поэтому — стандарт freedesktop: app_id "pass2fa" + ~/.local/share/applications/pass2fa.desktop
 //! + иконка в hicolor. Так её находит любая панель/док (waybar, sfwbar, …) — без привязки к DE.
-//! На Windows/X11 дополнительно ставится иконка окна (with_icon).
-use std::path::PathBuf;
+//! На Windows/X11 дополнительно ставится иконка окна (with_icon); на Windows — ещё ярлык в «Пуске» и иконка exe (build.rs).
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
 
 pub const APP_ID: &str = "pass2fa";
 pub static ICON_SVG: &[u8] = include_bytes!("../assets/pass2fa.svg");
@@ -122,11 +123,64 @@ pub fn uninstall() -> Vec<PathBuf> {
     removed
 }
 
-#[cfg(not(unix))]
+// Windows: ярлык «pass2fa» в меню «Пуск» (%APPDATA%\Microsoft\Windows\Start Menu\Programs) на pass2faw.exe —
+// GUI без консоли; иконка — из ресурса exe. Создаётся только из установленной копии (%LOCALAPPDATA%\pass2fa),
+// чтобы ярлык не вёл в папку сборки; пересоздаётся, если exe новее ярлыка (после обновления).
+#[cfg(windows)]
+fn shortcut() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join(r"Microsoft\Windows\Start Menu\Programs").join(format!("{APP_ID}.lnk")))
+}
+
+#[cfg(windows)]
+pub fn ensure_installed() -> Result<Vec<PathBuf>, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let home = dirs::data_local_dir().map(|d| d.join("pass2fa"));
+    let dir = exe.parent().map(Path::to_path_buf);
+    let canon = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::canonicalize(p).ok());
+    if canon(&home).is_none() || canon(&home) != canon(&dir) {
+        return Ok(vec![]); // запуск не из установленной копии — ярлык не трогаем
+    }
+    let gui = exe.with_file_name("pass2faw.exe");
+    let target = if gui.is_file() { gui } else { exe.clone() };
+    let lnk = shortcut().ok_or("нет %APPDATA%")?;
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if lnk.is_file() && mtime(&lnk) >= mtime(&target) {
+        return Ok(vec![]);
+    }
+    if let Some(d) = lnk.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    // пути — через переменные окружения: без проблем с кавычками и кириллицей в профиле
+    let ps = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:P2F_LNK);\
+              $s.TargetPath=$env:P2F_EXE;$s.WorkingDirectory=$env:P2F_DIR;\
+              $s.IconLocation=$env:P2F_EXE+',0';$s.Description='2FA Codes and Passwords';$s.Save()";
+    let st = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .env("P2F_LNK", &lnk)
+        .env("P2F_EXE", &target)
+        .env("P2F_DIR", target.parent().unwrap_or(Path::new(".")))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("powershell: {e}"))?;
+    if !st.success() {
+        return Err(format!("не удалось создать ярлык {}", lnk.display()));
+    }
+    Ok(vec![lnk])
+}
+
+#[cfg(windows)]
+pub fn uninstall() -> Vec<PathBuf> {
+    shortcut().into_iter().filter(|p| std::fs::remove_file(p).is_ok()).collect()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn ensure_installed() -> Result<Vec<PathBuf>, String> {
     Ok(vec![])
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn uninstall() -> Vec<PathBuf> {
     vec![]
 }

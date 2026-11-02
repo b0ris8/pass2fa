@@ -40,10 +40,15 @@ egui/eframe (wgpu), без GTK/порталов/DBus. Linux (Wayland) и Windows
     cargo build --release
     .\target\release\pass2fa.exe install
 
-`install` копирует программу в `%LOCALAPPDATA%\pass2fa\pass2fa.exe`, пишет манифесты хоста в
+`install` копирует программы в `%LOCALAPPDATA%\pass2fa\`: `pass2fa.exe` (консольная — CLI и хост для браузера)
+и `pass2faw.exe` (то же окно, но без консоли), создаёт ярлык **pass2fa** в меню «Пуск» на `pass2faw.exe`
+(закрепи его на панели задач правым кликом), пишет манифесты хоста в
 `%LOCALAPPDATA%\pass2fa\NativeMessagingHosts\` и ключи `HKCU\Software\{Mozilla,LibreWolf,Google\Chrome,Chromium}\NativeMessagingHosts\pass2fa`,
 раскладывает расширение в `%LOCALAPPDATA%\pass2fa\extension\`. Администратор не нужен, всё в профиле пользователя.
 В конце печатает команду, чтобы добавить папку программы в `PATH`.
+
+Иконка exe — готовый ресурс `assets/pass2fa.res`, его подключает `build.rs` (rc.exe и Windows SDK не нужны).
+Сменил `assets/pass2fa.svg` — пересобери ресурс на Linux: `./tools/gen-win-icon.sh`.
 
 Сборка на сетевом/облачном диске (`P:\…`): собирай с `--target-dir C:\build\pass2fa`, чтобы `target` не синхронизировался.
 
